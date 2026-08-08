@@ -14,7 +14,12 @@ services:
       - "80:80"
       - "443:443"
     environment:
-      LEERA_DOMAIN: ${LEERA_DOMAIN:-}
+      # Caddy's `{$VAR:default}` only falls back when the variable is UNSET, not
+      # when it is set-but-empty. install.sh always writes LEERA_DOMAIN= for a
+      # no-domain install, so the default must be applied here instead —
+      # otherwise the site address expands to nothing, Caddy reads the leading
+      # `{` as the global options block, and refuses to start.
+      LEERA_DOMAIN: ${LEERA_DOMAIN:-:80}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data

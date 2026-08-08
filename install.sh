@@ -27,6 +27,17 @@ INSTALL_DIR="${LEERA_HOME:-$HOME/leera}"
 RAW_BASE="${LEERA_RAW_BASE:-https://raw.githubusercontent.com/leera-app/leera-selfhost/main}"
 COMPOSE="docker compose"
 
+# Resolved once, before anything cd's. Deliberately does NOT fall back to $0:
+# under `curl … | bash` there is no script on disk, $0 is literally "bash", and
+# dirname would yield "." — which, after cd'ing into the install dir, points at
+# the install dir itself and makes the installer "copy" its own stale files
+# over themselves instead of downloading fresh ones. Empty here is the correct
+# signal for "piped, so download".
+SCRIPT_DIR=""
+if [ -n "${BASH_SOURCE[0]:-}" ]; then
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
+fi
+
 say()  { printf '\033[1;35m[leera]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[leera]\033[0m %s\n' "$*"; }
 fail() { printf '\033[1;31m[leera] ERROR:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -51,7 +62,7 @@ stack_network() {
 
 # Ask the running API what version it is. Empty when it is not up.
 api_version() {
-  docker exec leera-selfhost-api /bin/sh -c \
+  docker exec leera-selfhost-api /bin/bash -c \
     'exec 3<>/dev/tcp/127.0.0.1/8081 && printf "GET /api/v1/instance/status/ HTTP/1.0\r\n\r\n" >&3 && cat <&3' \
     2>/dev/null | tr ',' '\n' | sed -n 's/.*"version":"\([^"]*\)".*/\1/p' | head -1
 }
@@ -59,7 +70,7 @@ api_version() {
 wait_for_api() {
   say "waiting for the API"
   for _ in $(seq 1 120); do
-    if docker exec leera-selfhost-api /bin/sh -c 'exec 3<>/dev/tcp/127.0.0.1/8081 && printf "GET /api/v1/instance/status/ HTTP/1.0\r\n\r\n" >&3 && head -1 <&3 | grep -q 200' 2>/dev/null; then
+    if docker exec leera-selfhost-api /bin/bash -c 'exec 3<>/dev/tcp/127.0.0.1/8081 && printf "GET /api/v1/instance/status/ HTTP/1.0\r\n\r\n" >&3 && head -1 <&3 | grep -q 200' 2>/dev/null; then
       return 0
     fi
     sleep 2
@@ -245,16 +256,31 @@ do_install() {
   mkdir -p "$INSTALL_DIR"
   cd "$INSTALL_DIR"
 
-  # Prefer local files when run from a checkout; otherwise download the pinned set.
-  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)"
-  if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/docker-compose.yml" ]; then
+  # Prefer local files when run from a checkout; otherwise download the pinned
+  # set. The "$SCRIPT_DIR" != "$PWD" guard keeps a re-run from copying the
+  # install dir's own files onto themselves, which cp rejects.
+  if [ -n "$SCRIPT_DIR" ] && [ "$SCRIPT_DIR" != "$PWD" ] && [ -f "$SCRIPT_DIR/docker-compose.yml" ]; then
     cp "$SCRIPT_DIR/docker-compose.yml" ./docker-compose.yml
     cp "$SCRIPT_DIR/Caddyfile" ./Caddyfile
+    cp "$SCRIPT_DIR/install.sh" ./install.sh
   else
     say "downloading stack files"
     curl -fsSL "$RAW_BASE/docker-compose.yml" -o docker-compose.yml
     curl -fsSL "$RAW_BASE/Caddyfile" -o Caddyfile
+    # Every operator command (--upgrade, --backup, --restore, --status) is
+    # documented as `cd ~/leera && ./install.sh …`, so the script has to land
+    # here too. Under `curl … | bash` there is no local copy to copy from.
+    #
+    # Skipped when we are *already* executing ./install.sh from this directory:
+    # bash reads a script lazily by byte offset, so rewriting the file mid-run
+    # can make it resume at the wrong place. Download to a temp name and move
+    # it into place so the file is never half-written either.
+    if [ "$SCRIPT_DIR" != "$PWD" ]; then
+      curl -fsSL "$RAW_BASE/install.sh" -o install.sh.tmp
+      mv install.sh.tmp install.sh
+    fi
   fi
+  chmod +x ./install.sh
 
   if [ ! -f .env ]; then
     say "first install — generating secrets"
