@@ -46,12 +46,12 @@ require_install() {
 
 # The network the stack runs on, for one-off helper containers.
 stack_network() {
-  docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}' leera-minio 2>/dev/null
+  docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}' leera-selfhost-minio 2>/dev/null
 }
 
 # Ask the running API what version it is. Empty when it is not up.
 api_version() {
-  docker exec leera-api /bin/sh -c \
+  docker exec leera-selfhost-api /bin/sh -c \
     'exec 3<>/dev/tcp/127.0.0.1/8081 && printf "GET /api/v1/instance/status/ HTTP/1.0\r\n\r\n" >&3 && cat <&3' \
     2>/dev/null | tr ',' '\n' | sed -n 's/.*"version":"\([^"]*\)".*/\1/p' | head -1
 }
@@ -59,7 +59,7 @@ api_version() {
 wait_for_api() {
   say "waiting for the API"
   for _ in $(seq 1 120); do
-    if docker exec leera-api /bin/sh -c 'exec 3<>/dev/tcp/127.0.0.1/8081 && printf "GET /api/v1/instance/status/ HTTP/1.0\r\n\r\n" >&3 && head -1 <&3 | grep -q 200' 2>/dev/null; then
+    if docker exec leera-selfhost-api /bin/sh -c 'exec 3<>/dev/tcp/127.0.0.1/8081 && printf "GET /api/v1/instance/status/ HTTP/1.0\r\n\r\n" >&3 && head -1 <&3 | grep -q 200' 2>/dev/null; then
       return 0
     fi
     sleep 2
@@ -80,14 +80,14 @@ do_backup() {
 
   say "dumping the database"
   # Custom format: compressed, and restorable selectively if it comes to that.
-  docker exec leera-db pg_dump -U postgres -Fc leera > "$dest/leera.dump" \
+  docker exec leera-selfhost-db pg_dump -U postgres -Fc leera > "$dest/leera.dump" \
     || fail "pg_dump failed — is the database container running?"
 
   say "copying the secret key"
   # Without this file every encrypted column in the dump is unreadable — LLM
   # keys, SMTP passwords, OAuth secrets — and every session is invalid, since
   # JWTs are signed with it.
-  docker cp leera-api:/data/secret_key "$dest/secret_key" \
+  docker cp leera-selfhost-api:/data/secret_key "$dest/secret_key" \
     || fail "could not copy /data/secret_key from the api container"
   chmod 600 "$dest/secret_key"
 
@@ -152,21 +152,21 @@ do_restore() {
   say "starting the database only"
   $COMPOSE up -d db
   for _ in $(seq 1 60); do
-    docker exec leera-db pg_isready -U postgres -d leera >/dev/null 2>&1 && break
+    docker exec leera-selfhost-db pg_isready -U postgres -d leera >/dev/null 2>&1 && break
     sleep 2
   done
 
   say "restoring the database"
   # --clean --if-exists: replace a partially populated database rather than
   # merging into it, which would fail on every primary key.
-  docker exec -i leera-db pg_restore -U postgres -d leera --clean --if-exists < "$src/leera.dump" \
+  docker exec -i leera-selfhost-db pg_restore -U postgres -d leera --clean --if-exists < "$src/leera.dump" \
     || warn "pg_restore reported errors — review the output above before trusting this restore"
 
   say "restoring the secret key"
   $COMPOSE up -d api
   sleep 3
-  docker cp "$src/secret_key" leera-api:/data/secret_key
-  docker exec leera-api chmod 600 /data/secret_key 2>/dev/null || true
+  docker cp "$src/secret_key" leera-selfhost-api:/data/secret_key
+  docker exec leera-selfhost-api chmod 600 /data/secret_key 2>/dev/null || true
 
   if [ -d "$src/storage" ]; then
     say "restoring object storage"
