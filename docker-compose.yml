@@ -1,0 +1,146 @@
+# Leera self-hosted stack.
+#
+# Do not edit by hand for a normal install — run install.sh, which generates
+# the .env this file reads. Only the reverse proxy (caddy) publishes ports;
+# the API, database and object store are reachable solely on the internal
+# network, so forwarded headers and webhooks can only arrive through Caddy.
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    container_name: leera-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      LEERA_DOMAIN: ${LEERA_DOMAIN:-}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - web
+      - api
+
+  web:
+    image: ${LEERA_IMAGE_REPO:-ghcr.io/leera-app}/leera-web:${LEERA_VERSION:-selfhost}
+    container_name: leera-web
+    restart: unless-stopped
+    environment:
+      # SSR / Server Actions reach the API over the internal network.
+      SERVER_URL_INTERNAL: http://api:8081
+    depends_on:
+      - api
+
+  api:
+    image: ${LEERA_IMAGE_REPO:-ghcr.io/leera-app}/leera-api:${LEERA_VERSION:-selfhost}
+    container_name: leera-api
+    restart: unless-stopped
+    environment:
+      SERVER_ADDR: 0.0.0.0:8081
+      ENVIRONMENT: production
+      PG.HOST: db
+      PG.PORT: "5432"
+      PG.USER: postgres
+      PG.PASSWORD: ${POSTGRES_PASSWORD}
+      PG.DBNAME: leera
+      # SECRET_KEY is auto-generated on first boot into /data/secret_key.
+      # Back that file up together with the database.
+      SECRET_KEY_FILE: /data/secret_key
+      # Object storage: bundled MinIO. The public endpoint is this instance's
+      # own origin — presigned URLs resolve to /storage/... via Caddy.
+      S3_ENDPOINT: http://minio:9000
+      S3_PUBLIC_ENDPOINT: ${LEERA_PUBLIC_URL:-http://localhost}
+      AWS_BUCKET: storage
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      # Links inside notification emails (replaced by instance settings later).
+      APP_BASE_URL: ${LEERA_PUBLIC_URL:-http://localhost}
+      RUST_LOG: info
+    volumes:
+      - leera_data:/data
+    depends_on:
+      db:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  # One-shot schema migrator. Shares the API image; never runs as part of the
+  # long-lived API process. Reruns safely on every upgrade.
+  migrate:
+    image: ${LEERA_IMAGE_REPO:-ghcr.io/leera-app}/leera-api:${LEERA_VERSION:-selfhost}
+    container_name: leera-migrate
+    command: ["/usr/local/bin/migrate"]
+    environment:
+      ENVIRONMENT: production
+      MIGRATE_CONFIRM_PROD: "yes"
+      PG.HOST: db
+      PG.PORT: "5432"
+      PG.USER: postgres
+      PG.PASSWORD: ${POSTGRES_PASSWORD}
+      PG.DBNAME: leera
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  db:
+    image: postgres:17-alpine
+    container_name: leera-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: leera
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d leera"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+
+  minio:
+    image: minio/minio:latest
+    container_name: leera-minio
+    restart: unless-stopped
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # One-shot: create the `storage` bucket on first boot.
+  minio-init:
+    image: minio/mc:latest
+    container_name: leera-minio-init
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD &&
+      mc mb --ignore-existing local/storage
+      "
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    depends_on:
+      minio:
+        condition: service_healthy
+    restart: "no"
+
+volumes:
+  pgdata:
+  minio_data:
+  leera_data:
+  caddy_data:
+  caddy_config:

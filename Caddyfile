@@ -1,0 +1,30 @@
+# Leera self-hosted reverse proxy.
+#
+# LEERA_DOMAIN set (a real DNS name)  -> automatic HTTPS via Let's Encrypt.
+# LEERA_DOMAIN empty                  -> plain HTTP on :80 (LAN / evaluation).
+#
+# One public origin for everything:
+#   /api/*      -> Rust API   (WebSocket upgrades pass through; SSE unbuffered)
+#   /storage/*  -> MinIO      (path-style bucket "storage"; prefix NOT stripped,
+#                              it is part of the SigV4-signed URL)
+#   everything  -> Next.js web
+
+{$LEERA_DOMAIN::80} {
+	encode zstd gzip
+
+	handle /api/* {
+		# flush_interval -1 disables response buffering so AI SSE streams
+		# reach the browser token by token. WebSockets upgrade natively.
+		reverse_proxy api:8081 {
+			flush_interval -1
+		}
+	}
+
+	handle /storage/* {
+		reverse_proxy minio:9000
+	}
+
+	handle {
+		reverse_proxy web:5400
+	}
+}
