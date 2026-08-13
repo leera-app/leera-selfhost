@@ -1,0 +1,37 @@
+# The first-run setup service.
+#
+# Started by install.sh in its OWN compose project (-p leera-installer) before
+# the real stack exists. Sharing the main project would leave this container as
+# an orphan of it on the next `docker compose up`.
+#
+# It writes the operator's answers into the install directory and exits;
+# install.sh reads them and decides which of the real services to start.
+
+services:
+  installer:
+    image: ${LEERA_IMAGE_REPO:-ghcr.io/leera-app}/leera-api:${LEERA_VERSION:-selfhost}
+    container_name: leera-installer
+    command: ["/usr/local/bin/installer"]
+    restart: "no"
+    environment:
+      LEERA_INSTALL_TOKEN: ${LEERA_INSTALL_TOKEN:?installer token is required}
+      LEERA_INSTALL_DIR: /install
+      LEERA_INSTALL_BIND: 0.0.0.0:7777
+      # Set to "unavailable" by install.sh when port 80 was taken and the
+      # wizard had to fall back to loopback, so the domain check reports that
+      # it cannot verify instead of blaming the operator's DNS.
+      LEERA_DOMAIN_CHECK: ${LEERA_DOMAIN_CHECK:-}
+    ports:
+      # Port 80, so setup is reachable at the server's own address with no SSH
+      # tunnel — the operator this exists for does not have one. It is free at
+      # this point: the stack has not started, and Caddy takes the port later.
+      #
+      # This does put the form that receives database and cloud credentials on
+      # the network before any certificate can exist (none can — the domain is
+      # not verified yet). The one-time token in the URL is what guards it, and
+      # the window is minutes. Set LEERA_INSTALLER_BIND=127.0.0.1:7777 to keep
+      # it loopback-only and reach it over `ssh -L 7777:127.0.0.1:7777` instead.
+      - "${LEERA_INSTALLER_BIND:-0.0.0.0:80}:7777"
+    volumes:
+      # Where install.json and the secrets file land. install.sh polls this.
+      - ./:/install

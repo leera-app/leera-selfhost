@@ -5,6 +5,26 @@
 # the API, database and object store are reachable solely on the internal
 # network, so forwarded headers and webhooks can only arrive through Caddy.
 
+# Database connection, shared by the API and the one-shot migrator so the two
+# can never drift. Defaults reproduce the bundled Postgres, so an install that
+# predates external-database support keeps working with an unchanged .env.
+#
+# PG_SSL defaults to disable because the default target is the `db` container
+# on this host's bridge network, which speaks no TLS. Point LEERA_PG_HOST at an
+# external server and install.sh clears this so TLS is verified.
+x-pg-env: &pg-env
+  PG.HOST: ${LEERA_PG_HOST:-db}
+  PG.PORT: ${LEERA_PG_PORT:-5432}
+  PG.USER: ${LEERA_PG_USER:-postgres}
+  PG.PASSWORD: ${LEERA_PG_PASSWORD:-${POSTGRES_PASSWORD}}
+  PG.DBNAME: ${LEERA_PG_DBNAME:-leera}
+  # Single-dash, so a present-but-empty LEERA_PG_SSL means "TLS on" rather than
+  # collapsing back to the bundled default. `:-` here would silently connect an
+  # external database in plaintext.
+  PG_SSL: ${LEERA_PG_SSL-disable}
+  # Extra CA bundle for a private-CA Postgres; empty means "system + AWS RDS".
+  PG_CA_FILE: ${LEERA_PG_CA_FILE-}
+
 services:
   caddy:
     image: caddy:2-alpine
@@ -21,7 +41,11 @@ services:
       # `{` as the global options block, and refuses to start.
       LEERA_DOMAIN: ${LEERA_DOMAIN:-:80}
     volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # Caddyfile.no-storage drops the /storage route for external object
+      # stores. It has to be a separate file rather than a conditional block:
+      # Caddy resolves upstreams lazily, so a route pointing at an absent
+      # `minio` would return 502s instead of falling through to the web app.
+      - ./${LEERA_CADDYFILE:-Caddyfile}:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
     depends_on:
@@ -43,34 +67,58 @@ services:
     container_name: leera-selfhost-api
     restart: unless-stopped
     environment:
+      <<: *pg-env
       SERVER_ADDR: 0.0.0.0:8081
       ENVIRONMENT: production
-      PG.HOST: db
-      PG.PORT: "5432"
-      PG.USER: postgres
-      PG.PASSWORD: ${POSTGRES_PASSWORD}
-      PG.DBNAME: leera
       # SECRET_KEY is auto-generated on first boot into /data/secret_key.
       # Back that file up together with the database.
       SECRET_KEY_FILE: /data/secret_key
-      # Object storage: bundled MinIO. The public endpoint is this instance's
-      # own origin — presigned URLs resolve to /storage/... via Caddy.
-      S3_ENDPOINT: http://minio:9000
-      S3_PUBLIC_ENDPOINT: ${LEERA_PUBLIC_URL:-http://localhost}
-      AWS_BUCKET: storage
-      AWS_REGION: us-east-1
-      AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
-      AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+      # Object storage. Defaults are the bundled MinIO, reached over the
+      # internal network and served back to browsers as /storage/... by Caddy.
+      #
+      # The single-dash `-` forms below are load-bearing and must not become
+      # `:-`. For AWS, install.sh writes these keys as present-but-EMPTY, which
+      # is the only way to say "no custom endpoint": an absent
+      # S3_PUBLIC_ENDPOINT makes the API fall back to this instance's own
+      # origin and sign path-style URLs against it, which AWS never honours.
+      # `:-` would substitute the default for an empty value and reintroduce
+      # exactly that bug.
+      S3_ENDPOINT: ${LEERA_S3_ENDPOINT-http://minio:9000}
+      S3_PUBLIC_ENDPOINT: ${LEERA_S3_PUBLIC_ENDPOINT-${LEERA_PUBLIC_URL:-http://localhost}}
+      S3_FORCE_PATH_STYLE: ${LEERA_S3_PATH_STYLE-}
+      AWS_BUCKET: ${LEERA_S3_BUCKET:-storage}
+      AWS_REGION: ${LEERA_S3_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID: ${LEERA_S3_ACCESS_KEY:-${MINIO_ROOT_USER}}
+      AWS_SECRET_ACCESS_KEY: ${LEERA_S3_SECRET_KEY:-${MINIO_ROOT_PASSWORD}}
+      # On an external store the API copies this configuration into
+      # instance_settings on first boot, so the admin UI shows the real values
+      # instead of claiming the instance is on the bundled MinIO. Left as
+      # 'bundled' the seeding is skipped, and install.sh keeps owning the
+      # MinIO credentials it generates.
+      LEERA_STORAGE_MODE: ${LEERA_STORAGE_MODE:-bundled}
       # Links inside notification emails (replaced by instance settings later).
       APP_BASE_URL: ${LEERA_PUBLIC_URL:-http://localhost}
       RUST_LOG: info
     volumes:
       - leera_data:/data
+      # Private-CA bundle for an external Postgres, when the operator supplies
+      # one. Absent on a default install; `:ro` and never written to.
+      - ./secrets:/secrets:ro
+    # `required: false` is what lets the bundled services be switched off by
+    # profile: without it Compose rejects the whole project with "api depends
+    # on undefined service db" whenever the profile is inactive.
     depends_on:
       db:
         condition: service_healthy
+        required: false
       minio:
         condition: service_healthy
+        required: false
+      # The bucket must exist before the first upload. Previously nothing
+      # depended on this one-shot, so it raced the API's first request.
+      minio-init:
+        condition: service_completed_successfully
+        required: false
       migrate:
         condition: service_completed_successfully
 
@@ -81,19 +129,21 @@ services:
     container_name: leera-selfhost-migrate
     command: ["/usr/local/bin/migrate"]
     environment:
+      <<: *pg-env
       ENVIRONMENT: production
       MIGRATE_CONFIRM_PROD: "yes"
-      PG.HOST: db
-      PG.PORT: "5432"
-      PG.USER: postgres
-      PG.PASSWORD: ${POSTGRES_PASSWORD}
-      PG.DBNAME: leera
+    volumes:
+      - ./secrets:/secrets:ro
     depends_on:
       db:
         condition: service_healthy
+        required: false
     restart: "no"
 
+  # Bundled Postgres. Omitted entirely when the operator brings their own —
+  # see COMPOSE_PROFILES in .env, which install.sh derives from LEERA_DB_MODE.
   db:
+    profiles: ["db-bundled"]
     image: postgres:17-alpine
     container_name: leera-selfhost-db
     restart: unless-stopped
@@ -110,7 +160,9 @@ services:
       retries: 30
       start_period: 60s
 
+  # Bundled object store. Omitted when the operator points at real S3.
   minio:
+    profiles: ["s3-bundled"]
     image: minio/minio:latest
     container_name: leera-selfhost-minio
     restart: unless-stopped
@@ -126,8 +178,10 @@ services:
       timeout: 5s
       retries: 20
 
-  # One-shot: create the `storage` bucket on first boot.
+  # One-shot: create the `storage` bucket on first boot. External S3 buckets
+  # are created by the installer instead, using the API's own SigV4 client.
   minio-init:
+    profiles: ["s3-bundled"]
     image: minio/mc:latest
     container_name: leera-selfhost-minio-init
     entrypoint: >

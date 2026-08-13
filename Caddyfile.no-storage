@@ -1,0 +1,27 @@
+# Leera self-hosted reverse proxy — external object storage.
+#
+# Identical to Caddyfile minus the /storage route: with an external S3 bucket
+# there is no MinIO to proxy to, and browsers fetch objects directly from the
+# store using presigned URLs signed against its own hostname.
+#
+# Selected by LEERA_CADDYFILE in .env, which install.sh derives from
+# LEERA_STORAGE_MODE. Keep in sync with Caddyfile for the two shared routes.
+#
+#   /api/*      -> Rust API   (WebSocket upgrades pass through; SSE unbuffered)
+#   everything  -> Next.js web
+
+{$LEERA_DOMAIN::80} {
+	encode zstd gzip
+
+	handle /api/* {
+		# flush_interval -1 disables response buffering so AI SSE streams
+		# reach the browser token by token. WebSockets upgrade natively.
+		reverse_proxy api:8081 {
+			flush_interval -1
+		}
+	}
+
+	handle {
+		reverse_proxy web:5400
+	}
+}

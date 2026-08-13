@@ -55,9 +55,232 @@ require_install() {
   cd "$INSTALL_DIR"
 }
 
+# ── Topology (which containers run) ──────────────────────────────────────────
+
+# Upsert KEY=VALUE in .env. The key moves to the end of the file when it already
+# exists; harmless, and it avoids sed over operator-supplied values that can
+# contain slashes and ampersands (S3 secret keys routinely do).
+env_set() {
+  local key="$1" value="$2"
+  if [ -f .env ] && grep -q "^${key}=" .env; then
+    grep -v "^${key}=" .env > .env.tmp
+    printf '%s=%s\n' "$key" "$value" >> .env.tmp
+    mv .env.tmp .env
+  else
+    printf '%s=%s\n' "$key" "$value" >> .env
+  fi
+  chmod 600 .env
+}
+
+# True when .env defines KEY at all (even as empty). Distinct from "is non-empty"
+# because an empty value is meaningful for the endpoint and TLS keys.
+env_has() { [ -f .env ] && grep -q "^${1}=" .env; }
+
+# Every install before external-DB/storage support ran the bundled Postgres and
+# MinIO, so an .env without the mode keys must mean "bundled" for both. Getting
+# this wrong on upgrade would stop starting the operator's database.
+backfill_modes() {
+  if ! env_has LEERA_DB_MODE; then
+    env_set LEERA_DB_MODE bundled
+    say "no database mode recorded — assuming the bundled Postgres"
+  fi
+  if ! env_has LEERA_STORAGE_MODE; then
+    env_set LEERA_STORAGE_MODE bundled
+    say "no storage mode recorded — assuming the bundled MinIO"
+  fi
+}
+
+# Translate the two modes into the COMPOSE_PROFILES and Caddyfile that compose
+# reads. Always recomputed, so the modes are the single source of truth and the
+# two derived keys can never disagree with them.
+derive_topology() {
+  local db_mode="${LEERA_DB_MODE:-bundled}"
+  local storage_mode="${LEERA_STORAGE_MODE:-bundled}"
+  local profiles="" caddyfile="Caddyfile"
+
+  case "$db_mode" in
+    bundled)  profiles="db-bundled" ;;
+    external) profiles="" ;;
+    *) fail "LEERA_DB_MODE must be 'bundled' or 'external' (got '$db_mode')" ;;
+  esac
+
+  case "$storage_mode" in
+    bundled)  profiles="${profiles:+$profiles,}s3-bundled" ;;
+    external) caddyfile="Caddyfile.no-storage" ;;
+    *) fail "LEERA_STORAGE_MODE must be 'bundled' or 'external' (got '$storage_mode')" ;;
+  esac
+
+  # `required: false` in docker-compose.yml is what lets the bundled services be
+  # switched off — but it also makes a wrong profile fail OPEN: the project stays
+  # valid and the API starts with no database, dying at runtime instead of here.
+  # These two checks are the guard rail that turns that into a clear message.
+  if [ "$db_mode" = "external" ] && [ -z "${LEERA_PG_HOST:-}" ]; then
+    fail "LEERA_DB_MODE=external needs LEERA_PG_HOST set in $INSTALL_DIR/.env"
+  fi
+  if [ "$storage_mode" = "external" ] && [ -z "${LEERA_S3_BUCKET:-}" ]; then
+    fail "LEERA_STORAGE_MODE=external needs LEERA_S3_BUCKET set in $INSTALL_DIR/.env"
+  fi
+  [ -f "$caddyfile" ] || fail "$caddyfile is missing from $INSTALL_DIR — re-run the installer to fetch the stack files"
+
+  env_set COMPOSE_PROFILES "$profiles"
+  env_set LEERA_CADDYFILE "$caddyfile"
+
+  say "topology: database=$db_mode storage=$storage_mode (profiles: ${profiles:-none})"
+}
+
+# ── First-run setup wizard ───────────────────────────────────────────────────
+
+# Run the browser wizard and block until it has written install.json.
+#
+# The wizard runs as a container in its own compose project, with the install
+# directory bind-mounted. It never talks to Docker: a service that is reachable
+# before any login exists, and whose job is opening connections to hosts named
+# in the request body, must not also hold a socket that is root-equivalent on
+# this machine. So it writes a file, and this function reads it.
+run_wizard() {
+  local token
+  token="$(openssl rand -hex 16)"
+
+  say "starting the setup wizard"
+  # A wizard left behind by an interrupted run still holds port 80 and the
+  # container name, which would make this attempt fail with an error about
+  # neither. Clear it first — it carries no state worth keeping.
+  LEERA_INSTALL_TOKEN=unused $COMPOSE -f compose.installer.yml -p leera-installer down >/dev/null 2>&1 || true
+  docker rm -f leera-installer >/dev/null 2>&1 || true
+
+  # Port 80 is free before the stack exists, and the wizard needs it twice over:
+  # to be reachable without an SSH tunnel, and to answer the domain check the
+  # same way Let's Encrypt will. If something else already holds it, fall back
+  # to loopback rather than refusing to install.
+  local on_port_80=1
+  if ! LEERA_INSTALL_TOKEN="$token" $COMPOSE -f compose.installer.yml -p leera-installer up -d >/dev/null 2>&1; then
+    on_port_80=0
+    warn "port 80 is in use — setup will be reachable only on this machine, and the domain check is unavailable"
+    LEERA_INSTALL_TOKEN="$token" LEERA_INSTALLER_BIND=127.0.0.1:7777 \
+      LEERA_DOMAIN_CHECK=unavailable \
+      $COMPOSE -f compose.installer.yml -p leera-installer up -d >/dev/null 2>&1 \
+      || fail "could not start the setup wizard — check: $COMPOSE -f compose.installer.yml -p leera-installer logs"
+  fi
+
+  # Offer every address this machine might be reachable at and let the operator
+  # pick, rather than guessing one and being wrong.
+  #
+  # No single source is sufficient. An external echo service returns the
+  # internet-facing address — correct for a cloud VM with a public IP, but for
+  # a LAN server or a private VPC subnet it returns the router or NAT gateway,
+  # which does not route back here. The interface addresses cover exactly those
+  # cases, and cost nothing when the public one is also right.
+  local candidates=""
+  if [ "$on_port_80" = "1" ]; then
+    local public_ip
+    public_ip="$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null || true)"
+    [ -n "$public_ip" ] && candidates="$public_ip"
+
+    local iface_ips=""
+    if command -v ip >/dev/null 2>&1; then
+      iface_ips="$(ip -4 -o addr show scope global 2>/dev/null | awk '{split($4,a,"/"); print a[1]}')"
+    elif command -v ifconfig >/dev/null 2>&1; then
+      iface_ips="$(ifconfig 2>/dev/null | awk '/inet /{print $2}' | grep -v '^127\.')"
+    fi
+    for ip in $iface_ips; do
+      case " $candidates " in *" $ip "*) ;; *) candidates="${candidates:+$candidates }$ip" ;; esac
+    done
+    candidates="${candidates:+$candidates }localhost"
+  else
+    candidates="127.0.0.1:7777"
+  fi
+
+  # Tearing the wizard down has to happen even if the operator hits Ctrl-C,
+  # or the container keeps the port and the next run cannot bind it.
+  # shellcheck disable=SC2064
+  trap "LEERA_INSTALL_TOKEN=$token $COMPOSE -f compose.installer.yml -p leera-installer down >/dev/null 2>&1 || true" EXIT INT TERM
+
+  cat <<EOF
+
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  Open one of these in your browser to finish setup.                 │
+  │  Whichever address you already use to reach this machine:           │
+  │                                                                     │
+EOF
+  for h in $candidates; do
+    printf '  │      http://%s/?token=%s\n' "$h" "$token"
+  done
+  cat <<EOF
+  │                                                                     │
+  │  The link contains a one-time key. It works once, expires in an     │
+  │  hour, and setup closes itself as soon as you are done.             │
+  │                                                                     │
+  │  Waiting… (Ctrl-C to cancel)                                        │
+  └─────────────────────────────────────────────────────────────────────┘
+
+EOF
+
+  # 60 minutes, matching the wizard's own self-imposed deadline.
+  local waited=0
+  while [ ! -f install.json ]; do
+    if ! docker ps --format '{{.Names}}' | grep -q '^leera-installer$'; then
+      # It exits on its own only after a successful submit; anything else is a
+      # crash, and the file check below turns that into a clear failure.
+      sleep 2
+      [ -f install.json ] && break
+      fail "the setup wizard stopped before saving. Check: $COMPOSE -f compose.installer.yml -p leera-installer logs"
+    fi
+    sleep 2
+    waited=$((waited + 2))
+    [ "$waited" -ge 3600 ] && fail "timed out waiting for setup — re-run ./install.sh to try again"
+  done
+
+  say "settings received"
+  LEERA_INSTALL_TOKEN="$token" $COMPOSE -f compose.installer.yml -p leera-installer down >/dev/null 2>&1 || true
+  trap - EXIT INT TERM
+}
+
+# True when this install uses the bundled MinIO. Backup/restore mirror the
+# bucket only then — pulling an entire AWS bucket onto local disk is not what
+# that code is for, and the operator's own S3 lifecycle rules cover it.
+storage_is_bundled() { [ "${LEERA_STORAGE_MODE:-bundled}" = "bundled" ]; }
+
 # The network the stack runs on, for one-off helper containers.
 stack_network() {
-  docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}' leera-selfhost-minio 2>/dev/null
+  # The API is the one container present in every topology; MinIO is absent on
+  # an external-storage install, so it cannot be the only thing we ask.
+  local net
+  for c in leera-selfhost-api leera-selfhost-minio leera-selfhost-db; do
+    net="$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}' "$c" 2>/dev/null)"
+    [ -n "$net" ] && { printf '%s' "$net"; return 0; }
+  done
+  return 0
+}
+
+# ── Database access for backup/restore ───────────────────────────────────────
+#
+# The bundled Postgres is reachable with `docker exec`; an external one is not
+# reachable from the host at all in the general case (private subnet, or only
+# routable from inside the compose network). Both paths therefore go through a
+# client that sits on the stack network, and the bundled case keeps using the
+# container it already has.
+
+# Run a postgres client tool against whichever database this install uses.
+# Usage: pg_client_run <tool> [args...]   — stdin/stdout are passed through.
+pg_client_run() {
+  local tool="$1"; shift
+  if [ "${LEERA_DB_MODE:-bundled}" = "bundled" ]; then
+    docker exec -i leera-selfhost-db "$tool" -U postgres -d leera "$@"
+  else
+    local net; net="$(stack_network)"
+    # Image is pinned to the same major as the bundled server so dump formats
+    # stay compatible between a bundled backup and an external restore.
+    # shellcheck disable=SC2086
+    docker run --rm -i ${net:+--network "$net"} \
+      -e PGPASSWORD="${LEERA_PG_PASSWORD:-}" \
+      postgres:17-alpine \
+      "$tool" \
+        -h "${LEERA_PG_HOST:?LEERA_PG_HOST is not set}" \
+        -p "${LEERA_PG_PORT:-5432}" \
+        -U "${LEERA_PG_USER:-leera}" \
+        -d "${LEERA_PG_DBNAME:-leera}" \
+        "$@"
+  fi
 }
 
 # Ask the running API what version it is. Empty when it is not up.
@@ -89,10 +312,14 @@ do_backup() {
   mkdir -p "$dest"
   chmod 700 "$dest"
 
+  # Needed before the first pg_client_run: it decides bundled vs external.
+  # shellcheck disable=SC1091
+  . ./.env
+
   say "dumping the database"
   # Custom format: compressed, and restorable selectively if it comes to that.
-  docker exec leera-selfhost-db pg_dump -U postgres -Fc leera > "$dest/leera.dump" \
-    || fail "pg_dump failed — is the database container running?"
+  pg_client_run pg_dump -Fc > "$dest/leera.dump" \
+    || fail "pg_dump failed — is the database reachable?"
 
   say "copying the secret key"
   # Without this file every encrypted column in the dump is unreadable — LLM
@@ -106,18 +333,28 @@ do_backup() {
   cp .env "$dest/.env"
   chmod 600 "$dest/.env"
 
+  # Private-CA bundles and any other key material the stack mounts. Small, and
+  # a restore without them produces an instance that cannot reach its database.
+  if [ -d ./secrets ] && [ -n "$(ls -A ./secrets 2>/dev/null)" ]; then
+    say "copying secrets/"
+    cp -R ./secrets "$dest/secrets"
+    chmod -R go-rwx "$dest/secrets"
+  fi
+
   # Object storage (uploaded files, brand assets): large, so it is separate
   # from the three essentials and best-effort.
-  # shellcheck disable=SC1091
-  . ./.env
-  local net
-  net="$(stack_network)"
-  if [ -n "$net" ] && docker run --rm --network "$net" -v "$dest:/backup" \
-      --entrypoint /bin/sh minio/mc:latest -c \
-      "mc alias set local http://minio:9000 '$MINIO_ROOT_USER' '$MINIO_ROOT_PASSWORD' >/dev/null && mc mirror --quiet local/storage /backup/storage" 2>/dev/null; then
-    say "copied object storage"
+  if storage_is_bundled; then
+    local net
+    net="$(stack_network)"
+    if [ -n "$net" ] && docker run --rm --network "$net" -v "$dest:/backup" \
+        --entrypoint /bin/sh minio/mc:latest -c \
+        "mc alias set local http://minio:9000 '$MINIO_ROOT_USER' '$MINIO_ROOT_PASSWORD' >/dev/null && mc mirror --quiet local/storage /backup/storage" 2>/dev/null; then
+      say "copied object storage"
+    else
+      warn "object storage was not copied — uploaded files are not in this backup"
+    fi
   else
-    warn "object storage was not copied — uploaded files are not in this backup"
+    say "external object storage — files stay in your bucket, not in this backup"
   fi
 
   api_version > "$dest/VERSION" 2>/dev/null || true
@@ -128,8 +365,9 @@ do_backup() {
 
       leera.dump    database
       secret_key    decrypts everything in the dump — keep it with the dump
-      .env          container passwords
-      storage/      uploaded files (if copied)
+      .env          container passwords and which services this install runs
+      secrets/      private-CA bundles, if this install uses any
+      storage/      uploaded files (bundled object storage only)
 
   Copy the whole directory somewhere off this machine. A backup that lives
   only on the server it backs up is not a backup.
@@ -160,17 +398,33 @@ do_restore() {
     chmod 600 .env
   fi
 
-  say "starting the database only"
-  $COMPOSE up -d db
-  for _ in $(seq 1 60); do
-    docker exec leera-selfhost-db pg_isready -U postgres -d leera >/dev/null 2>&1 && break
-    sleep 2
-  done
+  if [ -d "$src/secrets" ]; then
+    say "restoring secrets/"
+    rm -rf ./secrets && cp -R "$src/secrets" ./secrets
+    chmod 700 ./secrets
+  fi
+
+  # The backup's .env carries the topology, so re-derive before touching compose.
+  backfill_modes
+  # shellcheck disable=SC1091
+  . ./.env
+  derive_topology
+
+  if [ "${LEERA_DB_MODE:-bundled}" = "bundled" ]; then
+    say "starting the database only"
+    $COMPOSE up -d db
+    for _ in $(seq 1 60); do
+      docker exec leera-selfhost-db pg_isready -U postgres -d leera >/dev/null 2>&1 && break
+      sleep 2
+    done
+  else
+    say "using the external database at ${LEERA_PG_HOST}"
+  fi
 
   say "restoring the database"
   # --clean --if-exists: replace a partially populated database rather than
   # merging into it, which would fail on every primary key.
-  docker exec -i leera-selfhost-db pg_restore -U postgres -d leera --clean --if-exists < "$src/leera.dump" \
+  pg_client_run pg_restore --clean --if-exists < "$src/leera.dump" \
     || warn "pg_restore reported errors — review the output above before trusting this restore"
 
   say "restoring the secret key"
@@ -179,10 +433,8 @@ do_restore() {
   docker cp "$src/secret_key" leera-selfhost-api:/data/secret_key
   docker exec leera-selfhost-api chmod 600 /data/secret_key 2>/dev/null || true
 
-  if [ -d "$src/storage" ]; then
+  if [ -d "$src/storage" ] && storage_is_bundled; then
     say "restoring object storage"
-    # shellcheck disable=SC1091
-    . ./.env
     local net
     net="$(stack_network)"
     [ -n "$net" ] && docker run --rm --network "$net" -v "$src/storage:/backup" \
@@ -208,6 +460,14 @@ do_restore() {
 do_upgrade() {
   require_docker
   require_install
+
+  # An install predating external-DB support has no mode keys. Record the
+  # bundled defaults before anything reads COMPOSE_PROFILES, or this upgrade
+  # would quietly stop starting the operator's own database and object store.
+  backfill_modes
+  # shellcheck disable=SC1091
+  . ./.env
+  derive_topology
 
   local before
   before="$(api_version)"
@@ -261,12 +521,16 @@ do_install() {
   # install dir's own files onto themselves, which cp rejects.
   if [ -n "$SCRIPT_DIR" ] && [ "$SCRIPT_DIR" != "$PWD" ] && [ -f "$SCRIPT_DIR/docker-compose.yml" ]; then
     cp "$SCRIPT_DIR/docker-compose.yml" ./docker-compose.yml
+    cp "$SCRIPT_DIR/compose.installer.yml" ./compose.installer.yml
     cp "$SCRIPT_DIR/Caddyfile" ./Caddyfile
+    cp "$SCRIPT_DIR/Caddyfile.no-storage" ./Caddyfile.no-storage
     cp "$SCRIPT_DIR/install.sh" ./install.sh
   else
     say "downloading stack files"
     curl -fsSL "$RAW_BASE/docker-compose.yml" -o docker-compose.yml
+    curl -fsSL "$RAW_BASE/compose.installer.yml" -o compose.installer.yml
     curl -fsSL "$RAW_BASE/Caddyfile" -o Caddyfile
+    curl -fsSL "$RAW_BASE/Caddyfile.no-storage" -o Caddyfile.no-storage
     # Every operator command (--upgrade, --backup, --restore, --status) is
     # documented as `cd ~/leera && ./install.sh …`, so the script has to land
     # here too. Under `curl … | bash` there is no local copy to copy from.
@@ -282,34 +546,32 @@ do_install() {
   fi
   chmod +x ./install.sh
 
+  # Bind-mounted read-only into api/migrate for a private-CA bundle. Created
+  # here so Docker does not create it root-owned on first `up`.
+  mkdir -p ./secrets && chmod 700 ./secrets
+
   if [ ! -f .env ]; then
     say "first install — generating secrets"
 
-    # Under `curl … | bash` stdin is the script itself, not a terminal, so a
-    # plain `read` would return nothing and silently configure http://localhost
-    # on a machine that wanted a real domain. Fall back to the controlling
-    # terminal; LEERA_DOMAIN covers genuinely unattended installs.
-    DOMAIN="${LEERA_DOMAIN:-}"
-    if [ -z "$DOMAIN" ]; then
-      if [ -t 0 ]; then
-        TTY_IN=""
-      elif [ -r /dev/tty ]; then
-        TTY_IN="/dev/tty"
-      else
-        TTY_IN="none"
-      fi
-
-      if [ "$TTY_IN" != "none" ]; then
-        printf '\033[1;35m[leera]\033[0m Domain for this instance (e.g. pm.example.com).\n'
-        printf '        Leave empty for plain HTTP on http://localhost.\n'
-        if [ -n "$TTY_IN" ]; then
-          read -r -p "        Domain: " DOMAIN < "$TTY_IN" || true
-        else
-          read -r -p "        Domain: " DOMAIN || true
-        fi
-      fi
+    # The browser wizard is the normal path: it asks where the database and
+    # files should live and verifies both before anything starts. It is skipped
+    # when the answers were supplied as environment variables, which is how
+    # unattended and scripted installs work.
+    if [ -z "${LEERA_DB_MODE:-}" ] && [ -z "${LEERA_STORAGE_MODE:-}" ] && [ ! -f install.json ]; then
+      run_wizard
     fi
 
+    # Answers from the wizard become environment for the rest of this function,
+    # so the two paths converge here and the .env template below is written once.
+    if [ -f install.secrets.env ]; then
+      set -a
+      # shellcheck disable=SC1091
+      . ./install.secrets.env
+      set +a
+      rm -f install.secrets.env   # one copy of every secret at rest, in .env
+    fi
+
+    DOMAIN="${LEERA_DOMAIN:-}"
     if [ -n "$DOMAIN" ]; then
       PUBLIC_URL="https://$DOMAIN"
     else
@@ -329,14 +591,64 @@ MINIO_ROOT_PASSWORD=$(openssl rand -hex 24)
 # you built locally with scripts/build-selfhost-images.sh.
 LEERA_IMAGE_REPO=${LEERA_IMAGE_REPO:-ghcr.io/leera-app}
 LEERA_VERSION=${LEERA_VERSION:-selfhost}
+
+# What this instance brings its own of: 'bundled' or 'external'. These decide
+# which containers run — install.sh turns them into COMPOSE_PROFILES below.
+LEERA_DB_MODE=${LEERA_DB_MODE:-bundled}
+LEERA_STORAGE_MODE=${LEERA_STORAGE_MODE:-bundled}
 EOF
+
+    if [ "${LEERA_DB_MODE:-bundled}" = "external" ]; then
+      cat >> .env <<EOF
+
+# External Postgres. Create the database first and let the migrate container
+# populate it. An empty LEERA_PG_SSL means TLS is verified against the system
+# trust store plus the built-in AWS RDS bundle; 'disable' turns TLS off; set
+# LEERA_PG_CA_FILE to a PEM under ./secrets for a private CA.
+LEERA_PG_HOST=${LEERA_PG_HOST:-}
+LEERA_PG_PORT=${LEERA_PG_PORT:-5432}
+LEERA_PG_USER=${LEERA_PG_USER:-leera}
+LEERA_PG_PASSWORD=${LEERA_PG_PASSWORD:-}
+LEERA_PG_DBNAME=${LEERA_PG_DBNAME:-leera}
+# Single-dash: an explicit 'disable' from the setup wizard must survive, while
+# an unset value still defaults to verified TLS. Hardcoding this empty silently
+# ignored the wizard's "Encrypt the connection" choice.
+LEERA_PG_SSL=${LEERA_PG_SSL-}
+LEERA_PG_CA_FILE=${LEERA_PG_CA_FILE:-}
+EOF
+    fi
+
+    if [ "${LEERA_STORAGE_MODE:-bundled}" = "external" ]; then
+      # Both endpoint keys are written PRESENT BUT EMPTY on purpose. Empty means
+      # "plain AWS S3": the API then signs virtual-hosted URLs against
+      # bucket.s3.region.amazonaws.com. Deleting these lines is not equivalent —
+      # absent makes the API fall back to this instance's own origin and sign
+      # path-style URLs that AWS will never honour. For an S3-compatible store
+      # (Wasabi, R2, MinIO elsewhere) set both to that store's URL instead.
+      cat >> .env <<EOF
+
+# External object storage.
+LEERA_S3_ENDPOINT=${LEERA_S3_ENDPOINT:-}
+LEERA_S3_PUBLIC_ENDPOINT=${LEERA_S3_PUBLIC_ENDPOINT:-}
+LEERA_S3_BUCKET=${LEERA_S3_BUCKET:-}
+LEERA_S3_REGION=${LEERA_S3_REGION:-us-east-1}
+LEERA_S3_ACCESS_KEY=${LEERA_S3_ACCESS_KEY:-}
+LEERA_S3_SECRET_KEY=${LEERA_S3_SECRET_KEY:-}
+LEERA_S3_PATH_STYLE=${LEERA_S3_PATH_STYLE:-}
+EOF
+    fi
+
     chmod 600 .env
   else
     say "existing .env found — keeping current secrets"
   fi
 
+  backfill_modes
+
   # shellcheck disable=SC1091
   . ./.env
+
+  derive_topology
 
   say "starting the stack (first run downloads images and can take a few minutes)"
   $COMPOSE up -d
