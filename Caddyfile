@@ -4,13 +4,28 @@
 # LEERA_DOMAIN empty                  -> plain HTTP on :80 (LAN / evaluation).
 #
 # One public origin for everything:
-#   /api/*      -> Rust API   (WebSocket upgrades pass through; SSE unbuffered)
-#   /storage/*  -> MinIO      (path-style bucket "storage"; prefix NOT stripped,
-#                              it is part of the SigV4-signed URL)
-#   everything  -> Next.js web
+#   /api/*           -> Rust API   (WebSocket upgrades pass through; SSE unbuffered)
+#   /_leera/update/* -> updater    (the one route that outlives an update)
+#   /storage/*       -> MinIO      (path-style bucket "storage"; prefix NOT stripped,
+#                                   it is part of the SigV4-signed URL)
+#   everything       -> Next.js web
 
 {$LEERA_DOMAIN::80} {
 	encode zstd gzip
+
+	# The update progress page — static files written by the updater into a
+	# volume mounted here read-only. Served by Caddy rather than proxied
+	# because Caddy is the one container an update does not replace: while api
+	# and web are restarting, this is all that is left answering.
+	#
+	# no-store because the whole point of the JSON below it is that it changes
+	# every second. Empty directory when the updater is switched off, which
+	# yields a 404 and affects nothing else.
+	handle_path /_leera/update/* {
+		root * /srv/update
+		header Cache-Control "no-store"
+		file_server
+	}
 
 	handle /api/* {
 		# flush_interval -1 disables response buffering so AI SSE streams

@@ -7,11 +7,20 @@
 # Selected by LEERA_CADDYFILE in .env, which install.sh derives from
 # LEERA_STORAGE_MODE. Keep in sync with Caddyfile for the two shared routes.
 #
-#   /api/*      -> Rust API   (WebSocket upgrades pass through; SSE unbuffered)
-#   everything  -> Next.js web
+#   /api/*           -> Rust API   (WebSocket upgrades pass through; SSE unbuffered)
+#   /_leera/update/* -> updater    (the one route that outlives an update)
+#   everything       -> Next.js web
 
 {$LEERA_DOMAIN::80} {
 	encode zstd gzip
+
+	# See Caddyfile: the update progress page, served by the one container
+	# that is still running while api and web are being replaced.
+	handle_path /_leera/update/* {
+		root * /srv/update
+		header Cache-Control "no-store"
+		file_server
+	}
 
 	handle /api/* {
 		# flush_interval -1 disables response buffering so AI SSE streams

@@ -48,6 +48,11 @@ services:
       - ./${LEERA_CADDYFILE:-Caddyfile}:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
+      # The update progress page, written by the updater. Read-only, and served
+      # as static files: Caddy is not recreated during an update, so this is
+      # what the operator's browser is still talking to while api and web are
+      # being replaced. Empty (and harmless) when the updater is switched off.
+      - update_state:/srv/update:ro
     depends_on:
       - web
       - api
@@ -98,6 +103,9 @@ services:
       LEERA_STORAGE_MODE: ${LEERA_STORAGE_MODE:-bundled}
       # Links inside notification emails (replaced by instance settings later).
       APP_BASE_URL: ${LEERA_PUBLIC_URL:-http://localhost}
+      # Shapes what the Updates page says when it cannot install an update
+      # itself: the fallback instructions have to match how this was deployed.
+      LEERA_DEPLOY_KIND: compose
       RUST_LOG: info
     volumes:
       - leera_data:/data
@@ -139,6 +147,52 @@ services:
         condition: service_healthy
         required: false
     restart: "no"
+
+  # The update service: what makes "Update now" in the admin UI possible.
+  #
+  # Omitted by profile when LEERA_UPDATER=off, because of what it needs to
+  # exist at all — the Docker socket, which is root on this host. Read
+  # deploy/selfhost/updater/README.md before deciding; the short version:
+  #
+  #   - It listens on nothing at all. The API writes a request file into the
+  #     shared volume and this container reads it; progress goes out as a file
+  #     that Caddy serves read-only. A container holding the Docker socket
+  #     should not also own a socket anything can connect to.
+  #   - It never runs anything but ./install.sh from the install directory —
+  #     the same script an operator runs over SSH, so the two upgrade paths
+  #     cannot drift.
+  #   - The image is a pinned Docker CLI plus a shell script; the script lives
+  #     in the install directory and is re-exec'd after every update, so this
+  #     image itself almost never needs replacing.
+  updater:
+    profiles: ["updater"]
+    image: ${LEERA_IMAGE_REPO:-ghcr.io/leera-app}/leera-updater:${LEERA_UPDATER_VERSION:-selfhost}
+    container_name: leera-selfhost-updater
+    restart: unless-stopped
+    environment:
+      LEERA_INSTALL_DIR: /install
+      LEERA_UPDATE_DIR: /data/update
+      LEERA_PUBLIC_URL: ${LEERA_PUBLIC_URL:-http://localhost}
+      # Bind mounts requested from inside this container are resolved by the
+      # daemon against the *host* filesystem, not against this container's.
+      # install.sh uses this to translate its own paths before handing them to
+      # `docker run -v` — without it, a backup taken from the UI would mirror
+      # object storage into a directory that does not exist on the host.
+      # Compose expands ${PWD} to the install directory it was invoked from.
+      LEERA_HOST_INSTALL_DIR: ${PWD}
+    volumes:
+      # Root on this host. Everything above is why that is acceptable.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # The install directory: docker-compose.yml, .env, and install.sh, which
+      # is the only program this container ever runs.
+      - ./:/install
+      # Shared with the api container: the request file it writes, and the
+      # result file it reads back. Deliberately NOT the directory Caddy
+      # serves — /data also holds secret_key.
+      - leera_data:/data
+      # What Caddy publishes at /_leera/update/: the progress page and one
+      # JSON state document per update. Write-only from here, read-only there.
+      - update_state:/srv/update
 
   # Bundled Postgres. Omitted entirely when the operator brings their own —
   # see COMPOSE_PROFILES in .env, which install.sh derives from LEERA_DB_MODE.
@@ -203,3 +257,4 @@ volumes:
   leera_data:
   caddy_data:
   caddy_config:
+  update_state:

@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Updating Leera</title>
+<!--
+  The update progress page.
+
+  Served by Caddy from a volume the updater writes, because while an update is
+  running there is no app and no API to serve anything: this page and the JSON
+  next to it are the only things still answering. It is therefore standalone —
+  no build step, no fonts, no scripts from anywhere else.
+
+  The token in ?t= is the capability that grants access to one update's log.
+  It never leaves this page.
+-->
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #fafaf9; --panel: #fff; --fg: #1c1917; --muted: #78716c;
+    --line: #e7e5e4; --accent: #7c3aed; --ok: #059669; --bad: #dc2626;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0c0a09; --panel: #1c1917; --fg: #fafaf9; --muted: #a8a29e;
+      --line: #292524; --accent: #a78bfa; --ok: #34d399; --bad: #f87171;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; background: var(--bg); color: var(--fg);
+    font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    display: flex; align-items: center; justify-content: center; padding: 24px;
+  }
+  main { width: 100%; max-width: 560px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 14px; padding: 28px;
+  }
+  h1 { margin: 0 0 6px; font-size: 19px; font-weight: 600; }
+  .sub { margin: 0 0 22px; color: var(--muted); font-size: 14px; }
+  ol { list-style: none; margin: 0; padding: 0; }
+  li {
+    display: flex; align-items: center; gap: 12px;
+    padding: 9px 0; color: var(--muted); font-size: 14px;
+  }
+  li[data-status="running"], li[data-status="done"] { color: var(--fg); }
+  .dot {
+    flex: none; width: 18px; height: 18px; border-radius: 50%;
+    border: 2px solid var(--line); display: grid; place-items: center;
+    font-size: 11px; font-weight: 700;
+  }
+  li[data-status="done"] .dot { border-color: var(--ok); color: var(--ok); }
+  li[data-status="failed"] .dot { border-color: var(--bad); color: var(--bad); }
+  li[data-status="running"] .dot {
+    border-color: var(--accent); border-top-color: transparent;
+    animation: spin .8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .note {
+    margin-top: 22px; padding-top: 18px; border-top: 1px solid var(--line);
+    color: var(--muted); font-size: 13px;
+  }
+  .banner { border-radius: 10px; padding: 14px 16px; margin-bottom: 18px; font-size: 14px; }
+  .banner.ok { background: color-mix(in srgb, var(--ok) 12%, transparent); color: var(--ok); }
+  .banner.bad { background: color-mix(in srgb, var(--bad) 12%, transparent); color: var(--bad); }
+  details { margin-top: 16px; }
+  summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+  pre {
+    margin: 10px 0 0; max-height: 260px; overflow: auto; padding: 12px;
+    background: var(--bg); border: 1px solid var(--line); border-radius: 8px;
+    font: 12px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap;
+  }
+  a.button {
+    display: inline-block; margin-top: 16px; padding: 9px 16px; border-radius: 8px;
+    background: var(--accent); color: #fff; text-decoration: none; font-size: 14px;
+  }
+</style>
+</head>
+<body>
+<main>
+  <div class="card">
+    <div id="banner" hidden></div>
+    <h1 id="title">Updating Leera</h1>
+    <p class="sub" id="subtitle">Getting started…</p>
+    <ol id="steps"></ol>
+    <details id="logbox" hidden>
+      <summary>Details</summary>
+      <pre id="log"></pre>
+    </details>
+    <p class="note" id="note">
+      This runs on the server. You can close this page — the update finishes either way.
+    </p>
+    <a class="button" id="home" href="/" hidden>Back to Leera</a>
+  </div>
+</main>
+<script>
+  const token = new URLSearchParams(location.search).get('t') || '';
+  const el = (id) => document.getElementById(id);
+  let settled = false;
+
+  // Only ever used as a filename next to this page; anything else is refused
+  // rather than fetched.
+  if (!/^[0-9a-f]{8,64}$/.test(token)) {
+    el('subtitle').textContent = 'This link is not valid. Open Updates in Instance Settings instead.';
+    el('home').hidden = false;
+  } else {
+    poll();
+    setInterval(poll, 2000);
+  }
+
+  async function poll() {
+    if (settled) return;
+    try {
+      const res = await fetch(`./${token}.json`, { cache: 'no-store' });
+      if (!res.ok) return;                       // not written yet
+      render(await res.json());
+    } catch {
+      // The API and web app are restarting; this page is static, so a failed
+      // poll means "not yet", never "something is wrong".
+    }
+  }
+
+  function render(s) {
+    el('steps').innerHTML = (s.steps || []).map((step) => `
+      <li data-status="${step.status}">
+        <span class="dot">${step.status === 'done' ? '✓' : step.status === 'failed' ? '!' : ''}</span>
+        <span>${escapeHtml(step.label)}</span>
+      </li>`).join('');
+
+    if (s.log && s.log.length) {
+      el('logbox').hidden = false;
+      const pre = el('log');
+      pre.textContent = s.log.join('\n');
+      pre.scrollTop = pre.scrollHeight;
+    }
+
+    if (s.status === 'running') {
+      el('subtitle').textContent = s.message || `Installing ${s.target_version}…`;
+      return;
+    }
+
+    settled = true;
+    const banner = el('banner');
+    banner.hidden = false;
+    el('home').hidden = false;
+    el('note').hidden = true;
+
+    if (s.status === 'success') {
+      banner.className = 'banner ok';
+      banner.textContent = `Updated to ${s.target_version}.`;
+      el('title').textContent = 'Update complete';
+      el('subtitle').textContent = 'Taking you back to Leera…';
+      setTimeout(() => (location.href = '/'), 2500);
+    } else {
+      banner.className = 'banner bad';
+      banner.textContent = s.message || 'The update did not complete.';
+      el('title').textContent = 'Update failed';
+      el('subtitle').textContent =
+        'Leera is still running the version it was on. The details below are what to send us.';
+      el('logbox').open = true;
+    }
+  }
+
+  function escapeHtml(s) {
+    return String(s ?? '').replace(/[&<>"']/g, (c) =>
+      ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+  }
+</script>
+</body>
+</html>

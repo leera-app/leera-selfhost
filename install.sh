@@ -14,9 +14,21 @@
 #   --status            show version and container health
 #   --help              this text
 #
+# Options for --upgrade:
+#   --to VERSION        install a specific version instead of the newest tag
+#   --refresh-bundle    also update docker-compose.yml, the Caddyfiles and this
+#                       script — a release that adds a service needs them
+#   --skip-backup       external databases only; you are asserting you have one
+#   --json-progress     emit machine-readable progress instead of prose
+#
 # A "complete" backup is three things — database dump, secret key, and .env.
 # Any one of them missing makes the other two useless, which is why backup and
 # restore are commands here rather than instructions in a document.
+#
+# This script is also what the in-app "Update now" button runs: the updater
+# container calls it with --json-progress. There is deliberately no second
+# upgrade implementation — the path almost nobody exercises by hand is the one
+# that would rot.
 
 set -euo pipefail
 
@@ -38,9 +50,69 @@ if [ -n "${BASH_SOURCE[0]:-}" ]; then
   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
 fi
 
-say()  { printf '\033[1;35m[leera]\033[0m %s\n' "$*"; }
-warn() { printf '\033[1;33m[leera]\033[0m %s\n' "$*"; }
-fail() { printf '\033[1;31m[leera] ERROR:\033[0m %s\n' "$*" >&2; exit 1; }
+# Upgrade options, set by the dispatcher at the bottom.
+JSON_PROGRESS=0
+TARGET_VERSION=""
+REFRESH_BUNDLE=0
+SKIP_BACKUP=0
+CURRENT_STEP=""
+
+# Minimal JSON string escaping. Deliberately not jq: this script runs on a bare
+# host before anything is installed, and the only characters that reach it are
+# our own messages plus docker's output.
+json_escape() {
+  local s="$*"
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\t'/ }
+  s=${s//$'\r'/}
+  s=${s//$'\n'/ }
+  printf '%s' "$s"
+}
+
+say()  {
+  if [ "$JSON_PROGRESS" = "1" ]; then
+    printf '{"event":"log","level":"info","message":"%s"}\n' "$(json_escape "$*")"
+  else
+    printf '\033[1;35m[leera]\033[0m %s\n' "$*"
+  fi
+}
+warn() {
+  if [ "$JSON_PROGRESS" = "1" ]; then
+    printf '{"event":"log","level":"warn","message":"%s"}\n' "$(json_escape "$*")"
+  else
+    printf '\033[1;33m[leera]\033[0m %s\n' "$*"
+  fi
+}
+fail() {
+  if [ "$JSON_PROGRESS" = "1" ]; then
+    [ -n "$CURRENT_STEP" ] && printf '{"event":"step","step":"%s","status":"failed"}\n' "$CURRENT_STEP"
+    printf '{"event":"log","level":"error","message":"%s"}\n' "$(json_escape "$*")"
+  else
+    printf '\033[1;31m[leera] ERROR:\033[0m %s\n' "$*" >&2
+  fi
+  exit 1
+}
+
+# Named stages, so the browser can draw a checklist instead of a log. The keys
+# are shared with deploy/selfhost/updater/updater.sh; a key added on one side
+# and not the other shows as a stage that never starts, which is the harmless
+# direction for that to fail.
+step() {
+  CURRENT_STEP="$1"
+  if [ "$JSON_PROGRESS" = "1" ]; then
+    printf '{"event":"step","step":"%s","status":"running","message":"%s"}\n' \
+      "$1" "$(json_escape "${2:-}")"
+  elif [ -n "${2:-}" ]; then
+    say "$2"
+  fi
+}
+step_done() {
+  if [ "$JSON_PROGRESS" = "1" ]; then
+    printf '{"event":"step","step":"%s","status":"done"}\n' "$1"
+  fi
+  CURRENT_STEP=""
+}
 
 # ── Shared helpers ───────────────────────────────────────────────────────────
 
@@ -88,6 +160,27 @@ backfill_modes() {
     env_set LEERA_STORAGE_MODE bundled
     say "no storage mode recorded — assuming the bundled MinIO"
   fi
+  # Installs predating the update service default to running it: that is the
+  # whole point of it existing, and an operator who does not want a container
+  # holding the Docker socket sets LEERA_UPDATER=off here.
+  if ! env_has LEERA_UPDATER; then
+    env_set LEERA_UPDATER on
+  fi
+}
+
+# Translate a path in *this* filesystem to the equivalent on the Docker host.
+#
+# Only differs when this script is running inside the updater container: a
+# `docker run -v` bind mount is resolved by the daemon against the host, so
+# passing /install/backups/... would mount a path that does not exist there and
+# silently produce an empty backup.
+host_path() {
+  local p="$1"
+  if [ -n "${LEERA_HOST_INSTALL_DIR:-}" ]; then
+    printf '%s' "${p/#$INSTALL_DIR/$LEERA_HOST_INSTALL_DIR}"
+  else
+    printf '%s' "$p"
+  fi
 }
 
 # Translate the two modes into the COMPOSE_PROFILES and Caddyfile that compose
@@ -108,6 +201,12 @@ derive_topology() {
     bundled)  profiles="${profiles:+$profiles,}s3-bundled" ;;
     external) caddyfile="Caddyfile.no-storage" ;;
     *) fail "LEERA_STORAGE_MODE must be 'bundled' or 'external' (got '$storage_mode')" ;;
+  esac
+
+  case "${LEERA_UPDATER:-on}" in
+    on)  profiles="${profiles:+$profiles,}updater" ;;
+    off) ;;
+    *) fail "LEERA_UPDATER must be 'on' or 'off' (got '${LEERA_UPDATER:-}')" ;;
   esac
 
   # `required: false` in docker-compose.yml is what lets the bundled services be
@@ -346,7 +445,7 @@ do_backup() {
   if storage_is_bundled; then
     local net
     net="$(stack_network)"
-    if [ -n "$net" ] && docker run --rm --network "$net" -v "$dest:/backup" \
+    if [ -n "$net" ] && docker run --rm --network "$net" -v "$(host_path "$dest"):/backup" \
         --entrypoint /bin/sh minio/mc:latest -c \
         "mc alias set local http://minio:9000 '$MINIO_ROOT_USER' '$MINIO_ROOT_PASSWORD' >/dev/null && mc mirror --quiet local/storage /backup/storage" 2>/dev/null; then
       say "copied object storage"
@@ -358,6 +457,13 @@ do_backup() {
   fi
 
   api_version > "$dest/VERSION" 2>/dev/null || true
+
+  # The banner is for someone who asked for a backup. During an update it is
+  # advice about a file they did not ask for, in the middle of a progress log.
+  if [ "$JSON_PROGRESS" = "1" ]; then
+    say "backup written to $dest"
+    return 0
+  fi
 
   cat <<EOF
 
@@ -437,7 +543,7 @@ do_restore() {
     say "restoring object storage"
     local net
     net="$(stack_network)"
-    [ -n "$net" ] && docker run --rm --network "$net" -v "$src/storage:/backup" \
+    [ -n "$net" ] && docker run --rm --network "$net" -v "$(host_path "$src/storage"):/backup" \
       --entrypoint /bin/sh minio/mc:latest -c \
       "mc alias set local http://minio:9000 '$MINIO_ROOT_USER' '$MINIO_ROOT_PASSWORD' >/dev/null && mc mirror --quiet /backup local/storage" \
       || warn "object storage restore failed — uploads may be missing"
@@ -457,6 +563,155 @@ do_restore() {
 
 # ── Upgrade ──────────────────────────────────────────────────────────────────
 
+# Files the release owns. An operator who edits one of these loses their edit
+# on the next --refresh-bundle, so we notice and stop instead.
+BUNDLE_FILES="docker-compose.yml compose.installer.yml Caddyfile Caddyfile.no-storage updater.sh update-progress.html"
+HASH_FILE=".bundle-hashes"
+
+bundle_hash() { openssl dgst -sha256 "$1" 2>/dev/null | awk '{print $NF}'; }
+
+# Record what we shipped, so drift can be told apart from a stale file.
+record_bundle_hashes() {
+  local f
+  : > "$HASH_FILE"
+  for f in $BUNDLE_FILES; do
+    [ -f "$f" ] && printf '%s %s\n' "$(bundle_hash "$f")" "$f" >> "$HASH_FILE"
+  done
+  chmod 600 "$HASH_FILE" 2>/dev/null || true
+}
+
+recorded_hash() {
+  [ -f "$HASH_FILE" ] || return 1
+  awk -v f="$1" '$2 == f { print $1; found=1 } END { exit !found }' "$HASH_FILE"
+}
+
+# Bring the stack files up to date.
+#
+# `--upgrade` used to pull images and nothing else, which meant a release that
+# added a service, changed a healthcheck, or added an environment key never
+# reached an existing install: it kept running the compose file from the day it
+# was installed. That is the bug this function exists to fix, and it matters
+# more once updates happen from the UI, where nobody is looking at the diff.
+refresh_bundle() {
+  step bundle "Fetching the new stack files"
+
+  local tmp f current recorded changed=0
+  tmp="$(mktemp -d)"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$tmp'" RETURN
+
+  for f in $BUNDLE_FILES install.sh; do
+    curl -fsSL "$RAW_BASE/$f" -o "$tmp/$f" 2>/dev/null || rm -f "$tmp/$f"
+  done
+
+  for f in $BUNDLE_FILES; do
+    [ -f "$tmp/$f" ] || continue
+    if [ -f "$f" ]; then
+      cmp -s "$f" "$tmp/$f" && continue
+      current="$(bundle_hash "$f")"
+      # No recorded hash means an install that predates this bookkeeping. We
+      # cannot tell an edit from an old file there, and refusing to update
+      # every such install is the worse mistake — so it falls through.
+      if recorded="$(recorded_hash "$f")" && [ "$current" != "$recorded" ]; then
+        fail "$INSTALL_DIR/$f has local edits, and this update needs to replace it.
+        Save your changes somewhere, restore the file, and update again.
+        Nothing has been changed."
+      fi
+    fi
+    cp "$tmp/$f" "$f"
+    changed=1
+    say "updated $f"
+  done
+  [ -x updater.sh ] || chmod +x updater.sh 2>/dev/null || true
+
+  # This script is running right now, and bash reads a script lazily by byte
+  # offset — rewriting it mid-run makes it resume at the wrong place. Staged
+  # here, moved into place by the last line of do_upgrade.
+  if [ -f "$tmp/install.sh" ] && ! cmp -s install.sh "$tmp/install.sh"; then
+    cp "$tmp/install.sh" install.sh.new
+    chmod +x install.sh.new
+    say "a new install.sh will be applied when this finishes"
+  fi
+
+  [ "$changed" = "1" ] || say "stack files are already current"
+  step_done bundle
+}
+
+# Images and a database dump both land here; running out of disk halfway
+# through an update is a much worse failure than refusing to start one.
+check_disk_space() {
+  local need_mb=6000 avail_kb avail_mb
+  avail_kb="$(df -Pk "$INSTALL_DIR" 2>/dev/null | awk 'NR==2 {print $4}')"
+  [ -n "$avail_kb" ] || return 0
+  avail_mb=$((avail_kb / 1024))
+  if [ "$avail_mb" -lt "$need_mb" ]; then
+    fail "only ${avail_mb} MB free on this server — an update needs about ${need_mb} MB
+        for the new images and a backup. Free some space and try again."
+  fi
+}
+
+# Confirm the image we just pulled is the one the signed release names.
+#
+# Tags move; digests do not. Without this, "install 1.4.2" means "install
+# whatever selfhost-1.4.2 points at today", and the signature on the manifest
+# stops being worth much.
+check_digest() {
+  local image="$1" expected="$2" actual
+  [ -n "$expected" ] || { say "no published digest for $image — skipping that check"; return 0; }
+
+  actual="$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$image" 2>/dev/null)"
+  case "$actual" in
+    *"$expected"*) say "verified $image" ;;
+    *) fail "the image downloaded for $image is not the one this release lists.
+        Nothing has been changed. This is worth reporting." ;;
+  esac
+}
+
+# Run the one-shot migrator and wait for it, so "updating the database" is a
+# visible stage rather than something hidden inside a dependency condition.
+run_migrations() {
+  step migrate "Updating the database"
+  $COMPOSE up -d migrate >/dev/null 2>&1 \
+    || fail "the database migrator could not be started. Check: $COMPOSE logs migrate"
+
+  local state code
+  for _ in $(seq 1 900); do
+    state="$(docker inspect -f '{{.State.Running}} {{.State.ExitCode}}' leera-selfhost-migrate 2>/dev/null || true)"
+    case "$state" in
+      "false "*)
+        code="${state#false }"
+        [ "$code" = "0" ] || fail "the database update failed (exit $code). Nothing else has been
+        changed — this instance is still on its previous version.
+        Check: $COMPOSE logs migrate"
+        step_done migrate
+        return 0
+        ;;
+    esac
+    sleep 2
+  done
+  fail "the database update is still running after 30 minutes. Check: $COMPOSE logs migrate"
+}
+
+# Put the previous version back. Images only: migrations are not reversible,
+# which is why the pre-update backup is taken and why that is said plainly.
+rollback_to() {
+  local tag="$1" backup="$2"
+  warn "rolling back to $tag"
+  env_set LEERA_VERSION "$tag"
+  $COMPOSE up -d caddy web api >/dev/null 2>&1 || true
+
+  if wait_for_api; then
+    fail "the update failed and this instance was put back on its previous version.
+        Database changes made by the new version are not undone. If anything looks
+        wrong, restore the pre-update backup:
+            ./install.sh --restore $backup"
+  fi
+  fail "the update failed, and putting the previous version back did not bring the
+        API up either. Restore the pre-update backup:
+            ./install.sh --restore $backup
+        Then check: $COMPOSE logs api migrate"
+}
+
 do_upgrade() {
   require_docker
   require_install
@@ -469,31 +724,93 @@ do_upgrade() {
   . ./.env
   derive_topology
 
-  local before
+  step preflight "Checking this server"
+  local before before_tag target_tag
   before="$(api_version)"
+  before_tag="${LEERA_VERSION:-selfhost}"
   say "current version: ${before:-unknown}"
 
-  # An upgrade runs migrations, and migrations are the one thing pulling the
-  # old image back will not undo. Back up first, always.
-  say "taking a pre-upgrade backup"
-  do_backup "$INSTALL_DIR/backups/pre-upgrade-$(date -u +%Y%m%dT%H%M%SZ)" >/dev/null
+  # Concrete tags, not the floating `selfhost` one: it is what makes "put the
+  # previous version back" mean something specific.
+  target_tag="$before_tag"
+  if [ -n "$TARGET_VERSION" ]; then
+    case "$TARGET_VERSION" in
+      *[!0-9.]*) fail "--to expects a version like 1.4.2 (got '$TARGET_VERSION')" ;;
+    esac
+    target_tag="selfhost-$TARGET_VERSION"
+  fi
+  check_disk_space
+  step_done preflight
 
-  say "pulling updated images"
+  # An upgrade runs migrations, and migrations are the one thing pulling the
+  # old image back will not undo. Back up first.
+  local backup_dir
+  backup_dir="$INSTALL_DIR/backups/pre-upgrade-$(date -u +%Y%m%dT%H%M%SZ)"
+  if [ "$SKIP_BACKUP" = "1" ] && [ "${LEERA_DB_MODE:-bundled}" = "external" ]; then
+    step backup "Skipping the backup, as requested"
+    warn "no pre-update backup was taken — you asserted you have your own"
+    backup_dir="(no backup taken)"
+    step_done backup
+  else
+    step backup "Backing up"
+    # Not silenced under --json-progress: do_backup's own output is structured
+    # there, and its failure message is the one thing someone watching an
+    # update actually needs. Only the human-readable banner is suppressed.
+    if [ "$JSON_PROGRESS" = "1" ]; then
+      do_backup "$backup_dir"
+    else
+      do_backup "$backup_dir" >/dev/null
+      say "backup written to $backup_dir"
+    fi
+    step_done backup
+  fi
+
+  [ "$REFRESH_BUNDLE" = "1" ] && refresh_bundle
+
+  if [ "$target_tag" != "$before_tag" ]; then
+    env_set LEERA_VERSION "$target_tag"
+    export LEERA_VERSION="$target_tag"
+  fi
+
+  step pull "Downloading the new version"
   # A locally built image has nothing to pull from; that is not a failure, it
   # just means the new version is whatever you built.
   $COMPOSE pull || warn "could not pull — continuing with the images already on this machine"
+  step_done pull
 
-  say "applying migrations and restarting"
-  # `up -d` re-runs the one-shot migrate container, which the api waits on.
-  $COMPOSE up -d
+  step verify "Verifying what was downloaded"
+  local repo="${LEERA_IMAGE_REPO:-ghcr.io/leera-app}"
+  check_digest "$repo/leera-api:$target_tag" "${LEERA_DIGEST_API:-}"
+  check_digest "$repo/leera-web:$target_tag" "${LEERA_DIGEST_WEB:-}"
+  step_done verify
 
+  run_migrations
+
+  step restart "Restarting"
+  # Everything except the updater, which is the container running this script.
+  $COMPOSE up -d caddy web api \
+    || rollback_to "$before_tag" "$backup_dir"
+  step_done restart
+
+  step health "Checking it came back"
   if ! wait_for_api; then
-    fail "the API did not come up after the upgrade. Check: $COMPOSE logs api migrate
-        The pre-upgrade backup is in $INSTALL_DIR/backups/"
+    rollback_to "$before_tag" "$backup_dir"
   fi
 
   local after
   after="$(api_version)"
+  if [ -n "$TARGET_VERSION" ] && [ -n "$after" ] && [ "$after" != "$TARGET_VERSION" ]; then
+    warn "expected version $TARGET_VERSION but the API reports $after"
+  fi
+  step_done health
+
+  # Safe now: this script has finished reading itself.
+  if [ -f install.sh.new ]; then
+    mv -f install.sh.new install.sh
+    chmod +x install.sh
+  fi
+  record_bundle_hashes
+
   say "upgrade complete: ${before:-unknown} → ${after:-unknown}"
 }
 
@@ -525,12 +842,19 @@ do_install() {
     cp "$SCRIPT_DIR/Caddyfile" ./Caddyfile
     cp "$SCRIPT_DIR/Caddyfile.no-storage" ./Caddyfile.no-storage
     cp "$SCRIPT_DIR/install.sh" ./install.sh
+    # The update service runs these two from here rather than from its own
+    # image, so that a release can change how updates work without having to
+    # replace the container that performs updates.
+    cp "$SCRIPT_DIR/updater/updater.sh" ./updater.sh
+    cp "$SCRIPT_DIR/updater/progress.html" ./update-progress.html
   else
     say "downloading stack files"
     curl -fsSL "$RAW_BASE/docker-compose.yml" -o docker-compose.yml
     curl -fsSL "$RAW_BASE/compose.installer.yml" -o compose.installer.yml
     curl -fsSL "$RAW_BASE/Caddyfile" -o Caddyfile
     curl -fsSL "$RAW_BASE/Caddyfile.no-storage" -o Caddyfile.no-storage
+    curl -fsSL "$RAW_BASE/updater.sh" -o updater.sh
+    curl -fsSL "$RAW_BASE/update-progress.html" -o update-progress.html
     # Every operator command (--upgrade, --backup, --restore, --status) is
     # documented as `cd ~/leera && ./install.sh …`, so the script has to land
     # here too. Under `curl … | bash` there is no local copy to copy from.
@@ -544,7 +868,8 @@ do_install() {
       mv install.sh.tmp install.sh
     fi
   fi
-  chmod +x ./install.sh
+  chmod +x ./install.sh ./updater.sh 2>/dev/null || true
+  record_bundle_hashes
 
   # Bind-mounted read-only into api/migrate for a private-CA bundle. Created
   # here so Docker does not create it root-owned on first `up`.
@@ -596,6 +921,15 @@ LEERA_VERSION=${LEERA_VERSION:-selfhost}
 # which containers run — install.sh turns them into COMPOSE_PROFILES below.
 LEERA_DB_MODE=${LEERA_DB_MODE:-bundled}
 LEERA_STORAGE_MODE=${LEERA_STORAGE_MODE:-bundled}
+
+# The update service, which is what makes "Update now" work in the admin UI.
+# Set to 'off' if you would rather no container held the Docker socket; updates
+# then happen here, with ./install.sh --upgrade.
+LEERA_UPDATER=${LEERA_UPDATER:-on}
+# Pinned separately from LEERA_VERSION: the update service is a Docker CLI and
+# a shell script, it is not replaced on every release, and it must not be the
+# container being recreated while it is performing a recreation.
+LEERA_UPDATER_VERSION=${LEERA_UPDATER_VERSION:-selfhost}
 EOF
 
     if [ "${LEERA_DB_MODE:-bundled}" = "external" ]; then
@@ -680,22 +1014,54 @@ EOF
   │  Copy the backup directory off this machine.                        │
   └─────────────────────────────────────────────────────────────────────┘
 
-  Upgrade later with:   cd $INSTALL_DIR && ./install.sh --upgrade
+  Updates arrive in the app: Instance Settings → Updates tells you when
+  there is a new version and installs it for you. That is what the
+  leera-selfhost-updater container is for — it holds this host's Docker
+  socket, so if you would rather it did not exist, set LEERA_UPDATER=off
+  in $INSTALL_DIR/.env and update from here instead.
+
+  Update from here any time with:   cd $INSTALL_DIR && ./install.sh --upgrade
 EOF
 }
 
 usage() {
-  sed -n '3,20p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//'
+  sed -n '3,30p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//'
 }
 
 # ── Dispatch ─────────────────────────────────────────────────────────────────
 
-case "${1:-}" in
+COMMAND=""
+ARG=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --upgrade|--backup|--restore|--status)
+      [ -z "$COMMAND" ] || fail "pick one command at a time ($COMMAND and $1)"
+      COMMAND="$1"
+      # --backup and --restore take a directory; --upgrade and --status do not.
+      case "$1" in
+        --backup|--restore)
+          if [ -n "${2:-}" ] && [ "${2#--}" = "$2" ]; then ARG="$2"; shift; fi
+          ;;
+      esac
+      ;;
+    --to)             TARGET_VERSION="${2:-}"; shift ;;
+    --refresh-bundle) REFRESH_BUNDLE=1 ;;
+    --skip-backup)    SKIP_BACKUP=1 ;;
+    --json-progress)  JSON_PROGRESS=1 ;;
+    --help|-h)        usage; exit 0 ;;
+    *)                fail "unknown option: $1 (try --help)" ;;
+  esac
+  shift
+done
+
+case "$COMMAND" in
+  # An upgrade driven from the UI always refreshes the stack files; one driven
+  # by hand asks for it, so an operator running --upgrade on a machine with no
+  # internet access to the bundle host still gets their images.
   --upgrade) do_upgrade ;;
-  --backup)  do_backup "${2:-}" ;;
-  --restore) do_restore "${2:-}" ;;
+  --backup)  do_backup "$ARG" ;;
+  --restore) do_restore "$ARG" ;;
   --status)  do_status ;;
-  --help|-h) usage ;;
   "")        do_install ;;
-  *)         fail "unknown option: $1 (try --help)" ;;
 esac
