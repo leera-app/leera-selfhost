@@ -9,8 +9,9 @@ API, PostgreSQL, object storage, and a reverse proxy with automatic HTTPS.
 
 ## Requirements
 
-- A Linux host with [Docker Engine](https://docs.docker.com/engine/install/)
-  and the [Compose plugin](https://docs.docker.com/compose/install/)
+- A Linux host, and either root or `sudo` on it. **Docker is not a
+  prerequisite** — the installer installs Docker Engine and the Compose plugin
+  itself if they are missing, after asking.
 - Ports **80** and **443** free — the proxy is the only thing that binds
   publicly; the API, database and object store stay on an internal network
 - For HTTPS: a domain with a DNS **A record already pointing at this server**.
@@ -21,6 +22,15 @@ API, PostgreSQL, object storage, and a reverse proxy with automatic HTTPS.
 ```bash
 curl -fsSL https://raw.githubusercontent.com/leera-app/leera-selfhost/main/install.sh | bash
 ```
+
+On a bare server that is the only command: Docker is installed first (via
+Docker's own install script), the daemon is started and enabled at boot, and
+your user is added to the `docker` group. That group only takes effect at your
+next login, so the rest of *this* run goes through `sudo` — nothing to do about
+it, and nothing to log out for.
+
+Add `LEERA_INSTALL_DOCKER=yes` to answer the Docker question up front for an
+unattended install, or `LEERA_INSTALL_DOCKER=no` to install Docker yourself.
 
 You will be asked for a domain. Enter one (e.g. `pm.example.com`) for automatic
 HTTPS via Let's Encrypt, or leave it blank for plain HTTP on `http://localhost`

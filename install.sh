@@ -21,6 +21,11 @@
 #   --skip-backup       external databases only; you are asserting you have one
 #   --json-progress     emit machine-readable progress instead of prose
 #
+# Docker is a prerequisite this script installs itself when it is missing:
+# Docker Engine plus the Compose plugin on Linux, Docker Desktop via Homebrew
+# on macOS. It asks first; LEERA_INSTALL_DOCKER=yes answers yes ahead of time
+# for unattended installs, LEERA_INSTALL_DOCKER=no declines and stops.
+#
 # A "complete" backup is three things — database dump, secret key, and .env.
 # Any one of them missing makes the other two useless, which is why backup and
 # restore are commands here rather than instructions in a document.
@@ -116,10 +121,322 @@ step_done() {
 
 # ── Shared helpers ───────────────────────────────────────────────────────────
 
+# Every fetch of a stack file goes through this.
+#
+# --connect-timeout is the point of it. raw.githubusercontent.com resolves to
+# four anycast addresses, and on networks that blackhole some of them (rather
+# than refusing the connection) curl waits out the OS SYN retry — 45-75 seconds
+# — before trying the next one. Seven files fetched serially turns that into
+# five to nine minutes of a silent terminal, which reads as a hang. Ten seconds
+# is far longer than any healthy connect and short enough that walking all four
+# addresses still costs less than one blackholed one used to.
+#
+# --retry covers the other half: a transient failure on the last address should
+# start the list over rather than abort an install.
+fetch() {
+  curl -fsSL \
+    --connect-timeout 10 \
+    --max-time 120 \
+    --retry 3 --retry-delay 2 --retry-connrefused \
+    "$@"
+}
+
+# Fetch one bundle file, announcing it first. The announcement is the whole
+# point: silence during a slow network is indistinguishable from a hang, and
+# this is the only place in an install that can stall for minutes with nothing
+# to show for it.
+FETCH_INDEX=0
+FETCH_TOTAL=0
+fetch_bundle_file() {
+  local name="$1" dest="${2:-$1}"
+  FETCH_INDEX=$((FETCH_INDEX + 1))
+  say "  [$FETCH_INDEX/$FETCH_TOTAL] $name"
+  fetch "$RAW_BASE/$name" -o "$dest" || fail "could not download $name from $RAW_BASE
+        The stack files are hosted on raw.githubusercontent.com. Check that this
+        machine can reach it:
+            curl -fsS -o /dev/null -w '%{http_code}\\n' $RAW_BASE/$name"
+}
+
+# ── Docker bootstrap ─────────────────────────────────────────────────────────
+#
+# "Install Docker first, then run this" is a second command, on a fresh server,
+# for something this script can do itself. So it does: a missing Docker Engine
+# or Compose plugin is installed here, and the promise on the README — one
+# command — is true on a bare host.
+
+# Every docker call in this script goes through this wrapper, including the ones
+# inside "$COMPOSE" (bash resolves the function before the PATH binary).
+#
+# It exists for the gap right after an install: adding the operator to the
+# `docker` group only takes effect at their next login, and telling someone to
+# log out halfway through an install is not an install. So we use sudo for the
+# rest of this run instead. -E because prefix assignments — the wizard's
+# LEERA_INSTALL_TOKEN, LEERA_VERSION — must survive into compose, and sudo
+# scrubs the environment by default.
+DOCKER_SUDO=0
+docker() {
+  if [ "$DOCKER_SUDO" = "1" ]; then
+    # shellcheck disable=SC2033  # the argument is the docker binary, not this function
+    command sudo -E docker "$@"
+  else
+    command docker "$@"
+  fi
+}
+
+# `type -P` and not `command -v`: the function above makes `command -v docker`
+# succeed on a host with no docker binary at all.
+have_docker() { type -P docker >/dev/null 2>&1; }
+
+# Set SUDO to whatever prefix gives us root, or fail the caller.
+SUDO=""
+need_root() {
+  [ "$(id -u)" = "0" ] && { SUDO=""; return 0; }
+  command -v sudo >/dev/null 2>&1 || return 1
+  # sudo reads its password from /dev/tty, not stdin, so this still works under
+  # `curl … | bash`, where stdin is the script.
+  sudo -n true 2>/dev/null || say "root is needed to install Docker — sudo may ask for your password"
+  sudo true || return 1
+  SUDO="sudo"
+}
+
+# Ask before installing system packages. Under `curl … | bash` stdin is the
+# script itself, so reading from it would swallow the rest of this file — the
+# question goes to /dev/tty.
+confirm_docker_install() {
+  case "${LEERA_INSTALL_DOCKER:-ask}" in
+    yes|1|true) return 0 ;;
+    no|0|false) return 1 ;;
+  esac
+  # The updater container is nobody's terminal, and it has Docker already.
+  [ "$JSON_PROGRESS" = "1" ] && return 1
+
+  local reply=""
+  if [ -r /dev/tty ]; then
+    printf '\033[1;35m[leera]\033[0m %s [Y/n] ' "$1" > /dev/tty
+    read -r reply < /dev/tty || reply=""
+  else
+    say "$1 — no terminal to ask on, continuing"
+    return 0
+  fi
+  case "$reply" in ""|y|Y|yes|YES|Yes) return 0 ;; *) return 1 ;; esac
+}
+
+DOCKER_DOCS="https://docs.docker.com/engine/install/"
+
+install_docker_linux() {
+  need_root || fail "Docker is not installed, and this script cannot install it without root.
+        Run it as root, or install Docker yourself and try again:
+            $DOCKER_DOCS"
+
+  say "installing Docker Engine and the Compose plugin"
+
+  # Docker's own convenience script, which is what their docs point at for
+  # exactly this case. It covers Debian/Ubuntu/RHEL/Fedora/CentOS/SLES and
+  # installs the compose plugin with the engine, so one download settles both.
+  local tmp
+  tmp="$(mktemp)"
+  if curl -fsSL https://get.docker.com -o "$tmp" && $SUDO sh "$tmp"; then
+    rm -f "$tmp"
+  else
+    rm -f "$tmp"
+    # Distros get.docker.com does not support, but which package Docker anyway.
+    if command -v apk >/dev/null 2>&1; then
+      $SUDO apk add --no-cache docker docker-cli-compose \
+        || fail "could not install Docker with apk — see $DOCKER_DOCS"
+    elif command -v pacman >/dev/null 2>&1; then
+      $SUDO pacman -Sy --noconfirm docker docker-compose \
+        || fail "could not install Docker with pacman — see $DOCKER_DOCS"
+    else
+      fail "Docker's installer did not run on this distribution.
+        Install Docker Engine and the Compose plugin by hand, then run this
+        script again:
+            $DOCKER_DOCS"
+    fi
+  fi
+
+  have_docker || fail "Docker still is not on PATH after installing it — see $DOCKER_DOCS"
+  start_docker_daemon
+  say "installed $(command docker --version 2>/dev/null || echo docker)"
+}
+
+install_docker_macos() {
+  command -v brew >/dev/null 2>&1 || fail "Docker Desktop is not installed. This script installs Docker on Linux
+        servers only; on a Mac, install Docker Desktop and start it first:
+            https://docs.docker.com/desktop/install/mac-install/"
+
+  say "installing Docker Desktop with Homebrew"
+  brew install --cask docker || fail "brew install --cask docker failed — install Docker Desktop by hand:
+            https://docs.docker.com/desktop/install/mac-install/"
+
+  start_docker_daemon
+  command docker info >/dev/null 2>&1 || fail "Docker Desktop was installed but its engine did not start. Open it once
+        from Applications, finish its first-run prompts, then run this again."
+}
+
+install_docker() {
+  case "$(uname -s)" in
+    Linux)  install_docker_linux ;;
+    Darwin) install_docker_macos ;;
+    *)      fail "no automatic Docker install for $(uname -s) — see $DOCKER_DOCS" ;;
+  esac
+}
+
+# Bring the daemon up if it is installed but not running. A packaged install
+# leaves it disabled on some distros, which otherwise looks identical to a
+# permissions problem.
+start_docker_daemon() {
+  command docker info >/dev/null 2>&1 && return 0
+
+  # Reachable as root means the daemon is fine and this is only a group
+  # membership problem, which resolve_docker_access sorts out. Restarting a
+  # healthy daemon underneath a running instance would be a poor way to find
+  # that out. -n so the probe never sits on a password prompt of its own.
+  if [ "$(id -u)" != "0" ] && command -v sudo >/dev/null 2>&1; then
+    # shellcheck disable=SC2033  # sudo runs the docker binary, not this function
+    sudo -n docker info >/dev/null 2>&1 && return 0
+  fi
+
+  # A Mac has no service manager to ask and no docker group to be missing from:
+  # the engine is Docker Desktop, so the only thing to do is launch it.
+  if [ "$(uname -s)" = "Darwin" ]; then
+    say "waiting for Docker Desktop to start"
+    open -a Docker 2>/dev/null || true
+    local mac_waited=0
+    while [ "$mac_waited" -lt 180 ]; do
+      command docker info >/dev/null 2>&1 && return 0
+      sleep 3
+      mac_waited=$((mac_waited + 3))
+    done
+    return 0
+  fi
+
+  need_root || return 0
+
+  if command -v systemctl >/dev/null 2>&1; then
+    say "starting the docker service"
+    $SUDO systemctl enable --now docker >/dev/null 2>&1 \
+      || $SUDO systemctl start docker >/dev/null 2>&1 || true
+  elif command -v rc-service >/dev/null 2>&1; then
+    say "starting the docker service"
+    $SUDO rc-update add docker default >/dev/null 2>&1 || true
+    $SUDO rc-service docker start >/dev/null 2>&1 || true
+  elif command -v service >/dev/null 2>&1; then
+    say "starting the docker service"
+    $SUDO service docker start >/dev/null 2>&1 || true
+  fi
+
+  local waited=0
+  while [ "$waited" -lt 60 ]; do
+    command docker info >/dev/null 2>&1 && return 0
+    $SUDO docker info >/dev/null 2>&1 && return 0
+    sleep 2
+    waited=$((waited + 2))
+  done
+  return 0
+}
+
+# Decide how the rest of this script reaches the daemon: directly, or via sudo.
+resolve_docker_access() {
+  command docker info >/dev/null 2>&1 && { DOCKER_SUDO=0; return 0; }
+
+  [ "$(id -u)" = "0" ] && return 1
+  command -v sudo >/dev/null 2>&1 || return 1
+  # shellcheck disable=SC2033  # ditto: sudo resolves docker from PATH
+  sudo docker info >/dev/null 2>&1 || return 1
+
+  # Without -E the wizard token and version pins never reach compose, and the
+  # failure would surface as an unrelated interpolation error much later.
+  sudo -E true 2>/dev/null || fail "Docker here works only through sudo, and this sudo will not preserve the
+        environment. Add yourself to the docker group instead, log out and back
+        in, then run this again:
+            sudo usermod -aG docker $(id -un)"
+
+  SUDO="sudo"
+  DOCKER_SUDO=1
+  # Membership takes effect at next login, so it does not help this run — it is
+  # what makes the *next* one, and plain `docker ps`, work without sudo.
+  if ! id -nG 2>/dev/null | tr ' ' '\n' | grep -qx docker; then
+    # usermod on glibc distros, addgroup on Alpine/BusyBox.
+    if $SUDO usermod -aG docker "$(id -un)" 2>/dev/null \
+       || $SUDO addgroup "$(id -un)" docker 2>/dev/null; then
+      warn "added $(id -un) to the 'docker' group — effective at your next login."
+      warn "until then this script talks to Docker through sudo."
+    else
+      warn "using sudo for Docker: $(id -un) is not in the 'docker' group."
+    fi
+  fi
+  return 0
+}
+
+install_compose_plugin() {
+  need_root || fail "the Docker Compose plugin is missing and cannot be installed without root — see
+            https://docs.docker.com/compose/install/"
+
+  say "installing the Docker Compose plugin"
+  if command -v apt-get >/dev/null 2>&1; then
+    $SUDO apt-get update -qq >/dev/null 2>&1 || true
+    $SUDO apt-get install -y docker-compose-plugin >/dev/null 2>&1 || true
+  elif command -v dnf >/dev/null 2>&1; then
+    $SUDO dnf install -y docker-compose-plugin >/dev/null 2>&1 || true
+  elif command -v yum >/dev/null 2>&1; then
+    $SUDO yum install -y docker-compose-plugin >/dev/null 2>&1 || true
+  elif command -v zypper >/dev/null 2>&1; then
+    $SUDO zypper --non-interactive install docker-compose >/dev/null 2>&1 || true
+  elif command -v apk >/dev/null 2>&1; then
+    $SUDO apk add --no-cache docker-cli-compose >/dev/null 2>&1 || true
+  elif command -v pacman >/dev/null 2>&1; then
+    $SUDO pacman -Sy --noconfirm docker-compose >/dev/null 2>&1 || true
+  fi
+  docker compose version >/dev/null 2>&1 && return 0
+
+  # No package, or a distro that ships only the deprecated v1 script. The plugin
+  # is a single static binary, so fetching it directly is the reliable path.
+  local arch dest tmp
+  case "$(uname -m)" in
+    x86_64|amd64)  arch=x86_64 ;;
+    aarch64|arm64) arch=aarch64 ;;
+    armv7l|armv7)  arch=armv7 ;;
+    *) fail "no Compose plugin build for $(uname -m) — see https://docs.docker.com/compose/install/" ;;
+  esac
+  dest=/usr/local/lib/docker/cli-plugins
+  tmp="$(mktemp)"
+  say "downloading the Compose plugin binary"
+  curl -fsSL "https://github.com/docker/compose/releases/latest/download/docker-compose-linux-$arch" -o "$tmp" \
+    || { rm -f "$tmp"; fail "could not download the Compose plugin — see https://docs.docker.com/compose/install/"; }
+  $SUDO mkdir -p "$dest"
+  $SUDO install -m 0755 "$tmp" "$dest/docker-compose" \
+    || { rm -f "$tmp"; fail "could not install the Compose plugin into $dest"; }
+  rm -f "$tmp"
+}
+
 require_docker() {
-  command -v docker >/dev/null 2>&1 || fail "docker is not installed — see https://docs.docker.com/engine/install/"
-  docker compose version >/dev/null 2>&1 || fail "the docker compose plugin is missing — see https://docs.docker.com/compose/install/"
-  docker info >/dev/null 2>&1 || fail "cannot talk to the docker daemon (is it running? do you need sudo?)"
+  if ! have_docker; then
+    confirm_docker_install "Docker is not installed. Install Docker Engine and the Compose plugin now?" \
+      || fail "Docker is required. Install it and run this again:
+            $DOCKER_DOCS
+        (or re-run with LEERA_INSTALL_DOCKER=yes to install it unattended)"
+    install_docker
+  fi
+
+  start_docker_daemon
+  resolve_docker_access || fail "cannot talk to the docker daemon (is it running? do you need sudo?)"
+
+  if ! docker compose version >/dev/null 2>&1; then
+    confirm_docker_install "The Docker Compose plugin is missing. Install it now?" \
+      || fail "the docker compose plugin is missing — see https://docs.docker.com/compose/install/"
+    install_compose_plugin
+    docker compose version >/dev/null 2>&1 \
+      || fail "the docker compose plugin is still missing after installing it — see
+            https://docs.docker.com/compose/install/"
+  fi
+}
+
+# Files `docker cp` and bind-mounted helpers create belong to root whenever we
+# are going through sudo. Hand them back, or the operator cannot chmod their own
+# backup — and the very next line of do_backup does exactly that.
+reclaim_path() {
+  [ "$DOCKER_SUDO" = "1" ] || return 0
+  sudo chown -R "$(id -u):$(id -g)" "$1" 2>/dev/null || true
 }
 
 require_install() {
@@ -426,6 +743,7 @@ do_backup() {
   # JWTs are signed with it.
   docker cp leera-selfhost-api:/data/secret_key "$dest/secret_key" \
     || fail "could not copy /data/secret_key from the api container"
+  reclaim_path "$dest/secret_key"
   chmod 600 "$dest/secret_key"
 
   say "copying .env"
@@ -455,6 +773,9 @@ do_backup() {
   else
     say "external object storage — files stay in your bucket, not in this backup"
   fi
+
+  # mc wrote the mirror as root through the bind mount; same reasoning as above.
+  reclaim_path "$dest"
 
   api_version > "$dest/VERSION" 2>/dev/null || true
 
@@ -600,8 +921,11 @@ refresh_bundle() {
   # shellcheck disable=SC2064
   trap "rm -rf '$tmp'" RETURN
 
+  # Best-effort per file: a bundle file that cannot be fetched leaves the
+  # current one in place, so fetch() rather than fetch_bundle_file(), which
+  # treats a failure as fatal.
   for f in $BUNDLE_FILES install.sh; do
-    curl -fsSL "$RAW_BASE/$f" -o "$tmp/$f" 2>/dev/null || rm -f "$tmp/$f"
+    fetch "$RAW_BASE/$f" -o "$tmp/$f" 2>/dev/null || rm -f "$tmp/$f"
   done
 
   for f in $BUNDLE_FILES; do
@@ -848,13 +1172,18 @@ do_install() {
     cp "$SCRIPT_DIR/updater/updater.sh" ./updater.sh
     cp "$SCRIPT_DIR/updater/progress.html" ./update-progress.html
   else
-    say "downloading stack files"
-    curl -fsSL "$RAW_BASE/docker-compose.yml" -o docker-compose.yml
-    curl -fsSL "$RAW_BASE/compose.installer.yml" -o compose.installer.yml
-    curl -fsSL "$RAW_BASE/Caddyfile" -o Caddyfile
-    curl -fsSL "$RAW_BASE/Caddyfile.no-storage" -o Caddyfile.no-storage
-    curl -fsSL "$RAW_BASE/updater.sh" -o updater.sh
-    curl -fsSL "$RAW_BASE/update-progress.html" -o update-progress.html
+    # Counted so the per-file lines below can say how far along they are. The
+    # seventh is install.sh, which the branch at the end of this block may skip.
+    FETCH_INDEX=0
+    FETCH_TOTAL=6
+    [ "$SCRIPT_DIR" != "$PWD" ] && FETCH_TOTAL=7
+    say "downloading stack files ($FETCH_TOTAL small files, a few seconds on a good connection)"
+    fetch_bundle_file docker-compose.yml
+    fetch_bundle_file compose.installer.yml
+    fetch_bundle_file Caddyfile
+    fetch_bundle_file Caddyfile.no-storage
+    fetch_bundle_file updater.sh
+    fetch_bundle_file update-progress.html
     # Every operator command (--upgrade, --backup, --restore, --status) is
     # documented as `cd ~/leera && ./install.sh …`, so the script has to land
     # here too. Under `curl … | bash` there is no local copy to copy from.
@@ -864,7 +1193,7 @@ do_install() {
     # can make it resume at the wrong place. Download to a temp name and move
     # it into place so the file is never half-written either.
     if [ "$SCRIPT_DIR" != "$PWD" ]; then
-      curl -fsSL "$RAW_BASE/install.sh" -o install.sh.tmp
+      fetch_bundle_file install.sh install.sh.tmp
       mv install.sh.tmp install.sh
     fi
   fi
@@ -1025,7 +1354,7 @@ EOF
 }
 
 usage() {
-  sed -n '3,30p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//'
+  sed -n '3,27p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//'
 }
 
 # ── Dispatch ─────────────────────────────────────────────────────────────────
