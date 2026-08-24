@@ -13,6 +13,16 @@ services:
     container_name: leera-installer
     command: ["/usr/local/bin/installer"]
     restart: "no"
+    # The answers land in the operator's own install directory through the bind
+    # mount at the bottom of this file. Without this line the container writes
+    # them as root with mode 0600, and install.sh — which runs as the operator,
+    # not as root — cannot read back the secrets it has been waiting for:
+    #
+    #   ./install.secrets.env: Permission denied
+    #
+    # install.sh passes its own uid:gid. The default keeps the previous
+    # behaviour for anyone starting this compose file by hand as root.
+    user: "${LEERA_INSTALL_UID:-0:0}"
     environment:
       LEERA_INSTALL_TOKEN: ${LEERA_INSTALL_TOKEN:?installer token is required}
       LEERA_INSTALL_DIR: /install

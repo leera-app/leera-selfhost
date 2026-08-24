@@ -5,13 +5,35 @@
 #
 # One public origin for everything:
 #   /api/*           -> Rust API   (WebSocket upgrades pass through; SSE unbuffered)
+#   /ai/sse          -> Rust API   (AI stream; exact path — /ai/* is web pages)
 #   /_leera/update/* -> updater    (the one route that outlives an update)
 #   /storage/*       -> MinIO      (path-style bucket "storage"; prefix NOT stripped,
 #                                   it is part of the SigV4-signed URL)
 #   everything       -> Next.js web
 
 {$LEERA_DOMAIN::80} {
-	encode zstd gzip
+	# Everything compressible except text/event-stream.
+	#
+	# Caddy's default match includes `text/*`, which swallows SSE: the AI
+	# stream came back gzipped, so it arrived buffered and browser clients
+	# failed on it. It worked in Postman only because Postman sends no
+	# Accept-Encoding. Listing the types explicitly keeps compression for the
+	# web app and leaves the event stream alone.
+	encode zstd gzip {
+		match {
+			header Content-Type text/html*
+			header Content-Type text/plain*
+			header Content-Type text/css*
+			header Content-Type text/javascript*
+			header Content-Type text/xml*
+			header Content-Type application/json*
+			header Content-Type application/javascript*
+			header Content-Type application/xhtml+xml*
+			header Content-Type application/xml*
+			header Content-Type image/svg+xml*
+			header Content-Type application/wasm*
+		}
+	}
 
 	# The update progress page — static files written by the updater into a
 	# volume mounted here read-only. Served by Caddy rather than proxied
@@ -25,6 +47,16 @@
 		root * /srv/update
 		header Cache-Control "no-store"
 		file_server
+	}
+
+	# The AI streaming endpoint. It lives at the API root rather than under
+	# /api, and it cannot be folded into a /ai/* rule: /ai/{workspace}/chat
+	# and its siblings are Next.js pages. Exact match, so only this one path
+	# leaves the web app.
+	handle /ai/sse {
+		reverse_proxy api:8081 {
+			flush_interval -1
+		}
 	}
 
 	handle /api/* {
@@ -42,4 +74,22 @@
 	handle {
 		reverse_proxy web:5400
 	}
+}
+
+# The MX hostname, present only so Caddy obtains a certificate for it.
+#
+# The mail listener is a separate container that cannot solve an ACME challenge
+# itself — it speaks SMTP, not HTTP. Caddy already owns :80 and :443, so it does
+# the issuance and renewal, and the mx container reads the result out of the
+# shared certificate volume (mounted read-only) to serve STARTTLS.
+#
+# Without this block there is no certificate for the MX hostname and STARTTLS is
+# disabled, which still delivers mail but gets the domain flagged by Google and
+# Microsoft for unencrypted transport.
+#
+# Empty when LEERA_MX_HOSTNAME is unset, which Caddy ignores.
+{$LEERA_MX_HOSTNAME:localhost.invalid} {
+	# Nothing is served here. The site exists for the certificate alone, so a
+	# stray request gets an honest answer rather than the web app.
+	respond "This hostname accepts mail on port 25, not HTTP." 421
 }

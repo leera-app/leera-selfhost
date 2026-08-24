@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Updating Leera</title>
+<title>Updating __APP_NAME__</title>
 <!--
   The update progress page.
 
@@ -82,7 +82,7 @@
 <main>
   <div class="card">
     <div id="banner" hidden></div>
-    <h1 id="title">Updating Leera</h1>
+    <h1 id="title">Updating __APP_NAME__</h1>
     <p class="sub" id="subtitle">Getting started…</p>
     <ol id="steps"></ol>
     <details id="logbox" hidden>
@@ -92,7 +92,7 @@
     <p class="note" id="note">
       This runs on the server. You can close this page — the update finishes either way.
     </p>
-    <a class="button" id="home" href="/" hidden>Back to Leera</a>
+    <a class="button" id="home" href="/" hidden>Back to __APP_NAME__</a>
   </div>
 </main>
 <script>
@@ -151,14 +151,14 @@
       banner.className = 'banner ok';
       banner.textContent = `Updated to ${s.target_version}.`;
       el('title').textContent = 'Update complete';
-      el('subtitle').textContent = 'Taking you back to Leera…';
+      el('subtitle').textContent = 'Taking you back to __APP_NAME__…';
       setTimeout(() => (location.href = '/'), 2500);
     } else {
       banner.className = 'banner bad';
       banner.textContent = s.message || 'The update did not complete.';
       el('title').textContent = 'Update failed';
       el('subtitle').textContent =
-        'Leera is still running the version it was on. The details below are what to send us.';
+        'The previous version is still running. The details below are what to send your administrator.';
       el('logbox').open = true;
     }
   }

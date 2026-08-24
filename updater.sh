@@ -46,12 +46,41 @@ mkdir -p "$UPDATE_DIR" "$DOCROOT"
 
 # ── Progress page ─────────────────────────────────────────────────────────────
 
+# The instance's own product name, for the progress page.
+#
+# The page is the one thing still answering while the app is down, so it cannot
+# fetch this itself — the name is baked in when the page is published, which is
+# whenever the updater starts and again just before an update begins. Falls back
+# to something unbranded rather than to the vendor's name: a whitelabelled
+# instance showing "Updating Leera" mid-update gives the whole thing away.
+progress_app_name() {
+  local name
+  name="$(curl -fsS --max-time 5 http://api:8081/api/v1/instance/public_config/ 2>/dev/null \
+    | jq -r '(.data // .).branding.app_name // empty' 2>/dev/null)"
+  # The name lands in HTML, so drop the characters that could close a tag.
+  name="$(printf '%s' "$name" | tr -d '<>&"' | cut -c1-60)"
+  [ -n "$name" ] && printf '%s' "$name" || printf 'the app'
+}
+
 # The bundled copy wins, for the same reason this script's does: it is the one
 # `install.sh --refresh-bundle` keeps current.
 install_progress_page() {
   local src=/opt/leera/progress.html
   [ -r "$INSTALL_DIR/update-progress.html" ] && src="$INSTALL_DIR/update-progress.html"
-  cp -f "$src" "$DOCROOT/index.html" 2>/dev/null || log "could not publish the progress page"
+
+  local name
+  name="$(progress_app_name)"
+  # Literal substitution: `sed s///` would take `/` and `&` in the name as
+  # syntax, and even awk's `gsub` treats `&` in the replacement specially.
+  if ! awk -v name="$name" '
+        { while ((i = index($0, "__APP_NAME__")) > 0)
+            $0 = substr($0, 1, i - 1) name substr($0, i + 12)
+          print }
+      ' "$src" > "$DOCROOT/index.html.tmp" 2>/dev/null \
+     || ! mv -f "$DOCROOT/index.html.tmp" "$DOCROOT/index.html" 2>/dev/null; then
+    rm -f "$DOCROOT/index.html.tmp"
+    cp -f "$src" "$DOCROOT/index.html" 2>/dev/null || log "could not publish the progress page"
+  fi
 }
 
 # ── Heartbeat ─────────────────────────────────────────────────────────────────
@@ -221,6 +250,11 @@ run_update() {
     rm -f "$CURRENT_FILE"
     return 0
   fi
+
+  # Re-publish while the API is still up: the instance may have been renamed
+  # since this container started, and the page is about to be the only thing
+  # anyone can see.
+  install_progress_page
 
   STATE_FILE="$DOCROOT/$TOKEN.json"
   LOG_FILE="$(mktemp)"

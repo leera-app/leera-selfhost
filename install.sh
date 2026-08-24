@@ -99,6 +99,17 @@ fail() {
   exit 1
 }
 
+# Compose names volumes "<project>_<volume>", and derives the project from the
+# directory it runs in: lowercased, with everything outside [a-z0-9_-] dropped.
+# Mirrored here so a volume can be looked for before compose is invoked.
+compose_project_name() {
+  if [ -n "${COMPOSE_PROJECT_NAME:-}" ]; then
+    printf '%s' "$COMPOSE_PROJECT_NAME"
+  else
+    basename "$INSTALL_DIR" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-'
+  fi
+}
+
 # Named stages, so the browser can draw a checklist instead of a log. The keys
 # are shared with deploy/selfhost/updater/updater.sh; a key added on one side
 # and not the other shows as a stage that never starts, which is the harmless
@@ -557,6 +568,14 @@ run_wizard() {
   local token
   token="$(openssl rand -hex 16)"
 
+  # The wizard writes install.json and install.secrets.env into this directory
+  # through a bind mount, and this script reads them back straight afterwards.
+  # A container writing as root would leave both files unreadable to whoever
+  # ran the install, so it is told to write as that person instead.
+  local install_uid
+  install_uid="$(id -u):$(id -g)"
+  export LEERA_INSTALL_UID="$install_uid"
+
   say "starting the setup wizard"
   # A wizard left behind by an interrupted run still holds port 80 and the
   # container name, which would make this attempt fail with an error about
@@ -704,6 +723,26 @@ api_version() {
   docker exec leera-selfhost-api /bin/bash -c \
     'exec 3<>/dev/tcp/127.0.0.1/8081 && printf "GET /api/v1/instance/status/ HTTP/1.0\r\n\r\n" >&3 && cat <&3' \
     2>/dev/null | tr ',' '\n' | sed -n 's/.*"version":"\([^"]*\)".*/\1/p' | head -1
+}
+
+# Make a changed Caddyfile take effect.
+#
+# The Caddyfile is a bind mount, so editing it does not change the container
+# spec and `compose up -d` considers caddy already up to date — it keeps
+# serving the config it read at boot. A routing fix shipped in a refreshed
+# bundle would therefore never apply, on any number of updates, until someone
+# restarted that container by hand. So ask Caddy to re-read it.
+#
+# Graceful: reload swaps the config with no dropped connections. Harmless when
+# the config is unchanged, and harmless when compose *did* just recreate caddy
+# (it is then reloading what it already has). A failed reload means the file is
+# invalid, which restarting would not fix either — say so and leave the working
+# config running.
+reload_caddy() {
+  $COMPOSE ps --status running --services 2>/dev/null | grep -qx caddy || return 0
+  $COMPOSE exec -T caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1 \
+    || warn "the reverse proxy kept its previous configuration — the new Caddyfile was rejected.
+        Check it with: $COMPOSE exec caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile"
 }
 
 wait_for_api() {
@@ -872,6 +911,7 @@ do_restore() {
 
   say "restarting the stack"
   $COMPOSE up -d
+  reload_caddy
   if wait_for_api; then
     say "restore complete — the API is answering (version $(api_version))"
     say "sign in to confirm: existing sessions survive when the secret key matches"
@@ -1023,6 +1063,7 @@ rollback_to() {
   warn "rolling back to $tag"
   env_set LEERA_VERSION "$tag"
   $COMPOSE up -d caddy web api >/dev/null 2>&1 || true
+  reload_caddy
 
   if wait_for_api; then
     fail "the update failed and this instance was put back on its previous version.
@@ -1114,6 +1155,7 @@ do_upgrade() {
   # Everything except the updater, which is the container running this script.
   $COMPOSE up -d caddy web api \
     || rollback_to "$before_tag" "$backup_dir"
+  reload_caddy
   step_done restart
 
   step health "Checking it came back"
@@ -1215,6 +1257,18 @@ do_install() {
       run_wizard
     fi
 
+    # An install dir left over from a version that ran the wizard as root has a
+    # secrets file this user cannot read. Sourcing it would fail with a bare
+    # "Permission denied" and no hint of what to do about it.
+    if [ -f install.secrets.env ] && [ ! -r install.secrets.env ]; then
+      fail "install.secrets.env is not readable by $(id -un) — an earlier install wrote it as root.
+  Fix it with:
+
+      sudo chown $(id -u):$(id -g) $INSTALL_DIR/install.secrets.env $INSTALL_DIR/install.json
+
+  then re-run this script."
+    fi
+
     # Answers from the wizard become environment for the rest of this function,
     # so the two paths converge here and the .env template below is written once.
     if [ -f install.secrets.env ]; then
@@ -1230,6 +1284,52 @@ do_install() {
       PUBLIC_URL="https://$DOMAIN"
     else
       PUBLIC_URL="http://localhost"
+    fi
+
+    # Postgres reads POSTGRES_PASSWORD only when it initialises an empty data
+    # directory. A pgdata volume left over from an earlier install therefore
+    # keeps whatever password it was born with, while the .env about to be
+    # written below gets a freshly generated one — and nothing notices until the
+    # migrator dies with "password authentication failed for user postgres",
+    # several steps and one confusing compose error later. The mismatch is only
+    # fixable while both halves are still in hand, so it is caught here.
+    if [ "${LEERA_DB_MODE:-bundled}" != "external" ]; then
+      pgdata_volume="$(compose_project_name)_pgdata"
+      db_container="$(compose_project_name)-selfhost-db"
+      if docker volume inspect "$pgdata_volume" >/dev/null 2>&1; then
+        # No apostrophes in the prose below: this heredoc is expanded inside a
+        # command substitution, where a lone quote character ends the string
+        # early and turns the rest of the script into a parse error.
+        stale_db_msg=$(cat <<EOM
+a database volume from an earlier install is still here, but its .env is gone.
+
+  Volume: $pgdata_volume
+
+The password lives in two places that have to agree: inside that volume, and in
+.env. Generating a new .env now would leave them disagreeing forever, so pick:
+
+  KEEP THE DATA. Put the matching .env back in $INSTALL_DIR and rerun.
+  If that .env is gone for good, give the volume a password you know:
+
+      docker compose up -d db
+      docker exec -it $db_container \\
+          psql -U postgres -c "ALTER USER postgres PASSWORD 'NEW_PASSWORD'"
+
+  then rerun, and put that same NEW_PASSWORD into the generated .env.
+
+  START CLEAN. This DESTROYS everything in that volume, including every
+  account, organization, and file recorded in it:
+
+      docker volume rm $pgdata_volume
+
+  Take a dump first if there is any doubt at all:
+
+      docker compose up -d db
+      docker exec $db_container pg_dumpall -U postgres > leera-backup.sql
+EOM
+)
+        fail "$stale_db_msg"
+      fi
     fi
 
     cat > .env <<EOF
@@ -1315,6 +1415,7 @@ EOF
 
   say "starting the stack (first run downloads images and can take a few minutes)"
   $COMPOSE up -d
+  reload_caddy
 
   if ! wait_for_api; then
     say "the API did not come up in time. Check logs with:"

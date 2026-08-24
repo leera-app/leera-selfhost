@@ -40,6 +40,11 @@ services:
       # otherwise the site address expands to nothing, Caddy reads the leading
       # `{` as the global options block, and refuses to start.
       LEERA_DOMAIN: ${LEERA_DOMAIN:-:80}
+      # Hostname the MX records point at. Caddy obtains its certificate so the
+      # mx container can serve STARTTLS; see the trailing site block in the
+      # Caddyfile. The placeholder is a name that never resolves, so an install
+      # without inbound mail gets a site Caddy simply never issues a cert for.
+      LEERA_MX_HOSTNAME: ${LEERA_MX_HOSTNAME:-localhost.invalid}
     volumes:
       # Caddyfile.no-storage drops the /storage route for external object
       # stores. It has to be a separate file rather than a conditional block:
@@ -73,6 +78,11 @@ services:
     restart: unless-stopped
     environment:
       <<: *pg-env
+      # One image serves both editions and already defaults to self_hosted, so
+      # this is redundant — deliberately. It is stated here because an operator
+      # reading their own compose file should be able to see which product they
+      # are running without knowing what the image defaults to.
+      LEERA_EDITION: self_hosted
       SERVER_ADDR: 0.0.0.0:8081
       ENVIRONMENT: production
       # SECRET_KEY is auto-generated on first boot into /data/secret_key.
@@ -126,6 +136,65 @@ services:
       # depended on this one-shot, so it raced the API's first request.
       minio-init:
         condition: service_completed_successfully
+        required: false
+      migrate:
+        condition: service_completed_successfully
+
+  # The built-in MX: inbound project email without a third-party parser.
+  #
+  # Same image as the API, different entrypoint — the pattern `migrate` uses, so
+  # there is no second image to build, pull, or version.
+  #
+  # Selected by profile (LEERA_INBOUND_MX=on → COMPOSE_PROFILES includes `mx`),
+  # because publishing a port is an install-time decision the admin UI cannot
+  # make on its own. The `inbound_email.mode` setting is the other half of the
+  # switch: with the profile on and the mode off, this process binds nothing.
+  #
+  # Why its own container rather than a thread in `api`: `build_pool` sets no
+  # max_size, so the API's pool is deadpool's default (num_cpus * 4, ~16 on a
+  # small box) shared with every HTTP handler. Every RCPT TO is a database
+  # lookup, so an SMTP flood run in-process would queue on those connections and
+  # hang the web app *behind* the admission limits. This process takes its own
+  # pool of 8.
+  mx:
+    profiles: ["mx"]
+    image: ${LEERA_IMAGE_REPO:-ghcr.io/leera-app}/leera-api:${LEERA_VERSION:-selfhost}
+    container_name: leera-selfhost-mx
+    command: ["/usr/local/bin/leera-mx"]
+    restart: unless-stopped
+    ports:
+      # Host 25 → container 2525. The container listens unprivileged, so nothing
+      # here needs root or CAP_NET_BIND_SERVICE.
+      #
+      # This is the only port besides Caddy's that the stack publishes. The API
+      # is still unreachable from outside, so P1's trusted-proxy property holds:
+      # forwarded headers can only arrive through Caddy.
+      - "25:2525"
+    environment:
+      <<: *pg-env
+      MX_BIND: 0.0.0.0:2525
+      ENVIRONMENT: production
+      SECRET_KEY_FILE: /data/secret_key
+      # Object storage: raw messages are spooled here before the SMTP session
+      # returns 250, and the API worker reads them back to build tickets.
+      S3_ENDPOINT: ${LEERA_S3_ENDPOINT-http://minio:9000}
+      S3_PUBLIC_ENDPOINT: ${LEERA_S3_PUBLIC_ENDPOINT-${LEERA_PUBLIC_URL:-http://localhost}}
+      S3_FORCE_PATH_STYLE: ${LEERA_S3_PATH_STYLE-}
+      AWS_BUCKET: ${LEERA_S3_BUCKET:-storage}
+      AWS_REGION: ${LEERA_S3_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID: ${LEERA_S3_ACCESS_KEY:-${MINIO_ROOT_USER}}
+      AWS_SECRET_ACCESS_KEY: ${LEERA_S3_SECRET_KEY:-${MINIO_ROOT_PASSWORD}}
+      RUST_LOG: info
+    volumes:
+      - leera_data:/data
+      - ./secrets:/secrets:ro
+      # Caddy's certificate store, read-only, so STARTTLS uses the instance's
+      # real certificate instead of a self-signed one. Requires the MX hostname
+      # to be in the Caddy site list — install.sh adds it.
+      - caddy_data:/caddy-data:ro
+    depends_on:
+      db:
+        condition: service_healthy
         required: false
       migrate:
         condition: service_completed_successfully
