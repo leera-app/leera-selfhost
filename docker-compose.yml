@@ -25,10 +25,29 @@ x-pg-env: &pg-env
   # Extra CA bundle for a private-CA Postgres; empty means "system + AWS RDS".
   PG_CA_FILE: ${LEERA_PG_CA_FILE-}
 
+# Container logs. Docker's default json-file driver has NO size limit, which on
+# a self-hosted box means the API's request log grows until the disk is full —
+# the single most common way one of these installs dies. Every service gets the
+# same cap: three 10 MB files, so the whole stack can never hold more than
+# ~30 MB of logs per container no matter how long it runs.
+#
+# Applied per-service rather than in /etc/docker/daemon.json because this file
+# is the thing we ship; a daemon setting would have to be installed on a host we
+# do not own, and would silently not exist on the next deployment target.
+#
+# Changing this only affects containers created afterwards — `docker compose up
+# -d --force-recreate` to apply it to a running stack.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   caddy:
     image: caddy:2-alpine
     container_name: leera-selfhost-caddy
+    logging: *logging
     restart: unless-stopped
     ports:
       - "80:80"
@@ -65,6 +84,7 @@ services:
   web:
     image: ${LEERA_IMAGE_REPO:-ghcr.io/leera-app}/leera-web:${LEERA_VERSION:-selfhost}
     container_name: leera-selfhost-web
+    logging: *logging
     restart: unless-stopped
     environment:
       # SSR / Server Actions reach the API over the internal network.
@@ -75,6 +95,7 @@ services:
   api:
     image: ${LEERA_IMAGE_REPO:-ghcr.io/leera-app}/leera-api:${LEERA_VERSION:-selfhost}
     container_name: leera-selfhost-api
+    logging: *logging
     restart: unless-stopped
     environment:
       <<: *pg-env
@@ -160,6 +181,7 @@ services:
     profiles: ["mx"]
     image: ${LEERA_IMAGE_REPO:-ghcr.io/leera-app}/leera-api:${LEERA_VERSION:-selfhost}
     container_name: leera-selfhost-mx
+    logging: *logging
     command: ["/usr/local/bin/leera-mx"]
     restart: unless-stopped
     ports:
@@ -204,6 +226,7 @@ services:
   migrate:
     image: ${LEERA_IMAGE_REPO:-ghcr.io/leera-app}/leera-api:${LEERA_VERSION:-selfhost}
     container_name: leera-selfhost-migrate
+    logging: *logging
     command: ["/usr/local/bin/migrate"]
     environment:
       <<: *pg-env
@@ -237,6 +260,7 @@ services:
     profiles: ["updater"]
     image: ${LEERA_IMAGE_REPO:-ghcr.io/leera-app}/leera-updater:${LEERA_UPDATER_VERSION:-selfhost}
     container_name: leera-selfhost-updater
+    logging: *logging
     restart: unless-stopped
     environment:
       LEERA_INSTALL_DIR: /install
@@ -269,6 +293,7 @@ services:
     profiles: ["db-bundled"]
     image: postgres:17-alpine
     container_name: leera-selfhost-db
+    logging: *logging
     restart: unless-stopped
     environment:
       POSTGRES_USER: postgres
@@ -288,6 +313,7 @@ services:
     profiles: ["s3-bundled"]
     image: minio/minio:latest
     container_name: leera-selfhost-minio
+    logging: *logging
     restart: unless-stopped
     command: server /data
     environment:
@@ -307,6 +333,7 @@ services:
     profiles: ["s3-bundled"]
     image: minio/mc:latest
     container_name: leera-selfhost-minio-init
+    logging: *logging
     entrypoint: >
       /bin/sh -c "
       mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD &&

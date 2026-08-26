@@ -16,6 +16,17 @@ API, PostgreSQL, object storage, and a reverse proxy with automatic HTTPS.
   publicly; the API, database and object store stay on an internal network
 - For HTTPS: a domain with a DNS **A record already pointing at this server**.
   Certificates are issued on first start, and that fails if DNS is not live yet.
+- **25 GB of disk**, and 2 GB of RAM. The stack itself is about 1 GB of images
+  and starts near-empty; the rest is headroom for your data, and for the fact
+  that an upgrade needs room for the new images while the old ones are still
+  there. An update refuses to start below 3 GB free rather than fill the disk
+  half way through — see [Upgrade](#upgrade).
+
+  Nothing here grows without a bound: container logs are capped, superseded
+  images are removed after every successful update, only the newest three
+  backups are kept on the server, and the application sweeps its own
+  operational logs on a retention schedule. Your own data — tickets, documents,
+  uploads — is the only thing that grows, which is as it should be.
 
 ## Install
 

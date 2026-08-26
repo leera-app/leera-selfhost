@@ -605,24 +605,21 @@ run_wizard() {
   # a LAN server or a private VPC subnet it returns the router or NAT gateway,
   # which does not route back here. The interface addresses cover exactly those
   # cases, and cost nothing when the public one is also right.
-  local candidates=""
+  local public_ip=""
+  local iface_ips=""
   if [ "$on_port_80" = "1" ]; then
-    local public_ip
     public_ip="$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null || true)"
-    [ -n "$public_ip" ] && candidates="$public_ip"
 
-    local iface_ips=""
+    local raw_iface_ips=""
     if command -v ip >/dev/null 2>&1; then
-      iface_ips="$(ip -4 -o addr show scope global 2>/dev/null | awk '{split($4,a,"/"); print a[1]}')"
+      raw_iface_ips="$(ip -4 -o addr show scope global 2>/dev/null | awk '{split($4,a,"/"); print a[1]}')"
     elif command -v ifconfig >/dev/null 2>&1; then
-      iface_ips="$(ifconfig 2>/dev/null | awk '/inet /{print $2}' | grep -v '^127\.')"
+      raw_iface_ips="$(ifconfig 2>/dev/null | awk '/inet /{print $2}' | grep -v '^127\.')"
     fi
-    for ip in $iface_ips; do
-      case " $candidates " in *" $ip "*) ;; *) candidates="${candidates:+$candidates }$ip" ;; esac
+    for ip in $raw_iface_ips; do
+      [ "$ip" = "$public_ip" ] && continue
+      case " $iface_ips " in *" $ip "*) ;; *) iface_ips="${iface_ips:+$iface_ips }$ip" ;; esac
     done
-    candidates="${candidates:+$candidates }localhost"
-  else
-    candidates="127.0.0.1:7777"
   fi
 
   # Tearing the wizard down has to happen even if the operator hits Ctrl-C,
@@ -633,13 +630,27 @@ run_wizard() {
   cat <<EOF
 
   ┌─────────────────────────────────────────────────────────────────────┐
-  │  Open one of these in your browser to finish setup.                 │
-  │  Whichever address you already use to reach this machine:           │
+  │  Open one of these in your browser to finish setup:                 │
   │                                                                     │
 EOF
-  for h in $candidates; do
-    printf '  │      http://%s/?token=%s\n' "$h" "$token"
-  done
+  if [ "$on_port_80" = "1" ]; then
+    if [ -n "$public_ip" ]; then
+      echo "  │  On a cloud VM or server with a public IP (AWS, GCP, a VPS...):"
+      printf '  │      http://%s/?token=%s\n' "$public_ip" "$token"
+      echo "  │"
+    fi
+    if [ -n "$iface_ips" ]; then
+      echo "  │  On the same network or VPC as this machine:"
+      for h in $iface_ips; do
+        printf '  │      http://%s/?token=%s\n' "$h" "$token"
+      done
+      echo "  │"
+    fi
+    echo "  │  Right on this machine:"
+    printf '  │      http://localhost/?token=%s\n' "$token"
+  else
+    printf '  │      http://127.0.0.1:7777/?token=%s\n' "$token"
+  fi
   cat <<EOF
   │                                                                     │
   │  The link contains a one-time key. It works once, expires in an     │
@@ -1003,15 +1014,116 @@ refresh_bundle() {
 
 # Images and a database dump both land here; running out of disk halfway
 # through an update is a much worse failure than refusing to start one.
+# Free space needed before an update starts.
+#
+# Covers the new images arriving while the old ones are still on disk, plus a
+# pre-upgrade backup. It is a floor, not a measurement: the backup's real size
+# depends on how much has been uploaded to this instance, which we cannot know
+# before taking it. Raise it with LEERA_MIN_FREE_MB on an instance with a lot
+# of attachments.
+MIN_FREE_MB="${LEERA_MIN_FREE_MB:-3000}"
+
+free_mb() {
+  local kb
+  kb="$(df -Pk "$INSTALL_DIR" 2>/dev/null | awk 'NR==2 {print $4}')"
+  [ -n "$kb" ] || return 1
+  echo $((kb / 1024))
+}
+
+# Refuse an update that would run the disk out — but reclaim what is already
+# reclaimable before deciding.
+#
+# Previously this failed outright, which put an instance into a state it could
+# not leave through the admin UI: the update button reported "not enough disk"
+# while several hundred MB of superseded images sat there unreferenced, and
+# nothing in the product would remove them. Pruning here is safe at this point
+# in the run — nothing has been pulled yet, so `dangling=true` cannot match an
+# image this upgrade is about to need.
 check_disk_space() {
-  local need_mb=6000 avail_kb avail_mb
-  avail_kb="$(df -Pk "$INSTALL_DIR" 2>/dev/null | awk 'NR==2 {print $4}')"
-  [ -n "$avail_kb" ] || return 0
-  avail_mb=$((avail_kb / 1024))
-  if [ "$avail_mb" -lt "$need_mb" ]; then
-    fail "only ${avail_mb} MB free on this server — an update needs about ${need_mb} MB
-        for the new images and a backup. Free some space and try again."
+  local avail
+  avail="$(free_mb)" || return 0
+  [ "$avail" -ge "$MIN_FREE_MB" ] && return 0
+
+  say "only ${avail} MB free — reclaiming space before continuing"
+  docker image prune -f >/dev/null 2>&1 || true
+  prune_backups
+
+  avail="$(free_mb)" || return 0
+  if [ "$avail" -lt "$MIN_FREE_MB" ]; then
+    fail "only ${avail} MB free on this server, and reclaiming what it could
+        did not get above ${MIN_FREE_MB} MB. An update needs that much for the
+        new images and a backup.
+
+        Space is most often in old backups or Docker data:
+          du -sh $INSTALL_DIR/backups/*
+          docker system df
+
+        Copy old backups off this machine and delete them, or grow the disk.
+        Set LEERA_MIN_FREE_MB to override this check if you know better."
   fi
+  say "reclaimed enough to continue — ${avail} MB free"
+}
+
+# ── Reclaiming space ─────────────────────────────────────────────────────────
+#
+# Nothing in a self-hosted install may grow without a bound. Both functions
+# below exist because an install that has been upgraded a dozen times must sit
+# on roughly the same amount of disk as one installed yesterday.
+
+# How many pre-upgrade backups to keep on the server itself. Three is enough to
+# step back past a bad release; it is not an archive, and it was never meant to
+# be one — the banner in do_backup says to copy them off the machine.
+BACKUP_KEEP="${LEERA_BACKUP_KEEP:-3}"
+
+# Delete all but the newest $BACKUP_KEEP backups.
+#
+# Only ever considers directories this script created — the `pre-upgrade-*` and
+# timestamp-named ones under $INSTALL_DIR/backups. A path the operator passed to
+# --backup by hand is theirs, not ours, and is never swept.
+prune_backups() {
+  local dir="$INSTALL_DIR/backups"
+  [ -d "$dir" ] || return 0
+  [ "$BACKUP_KEEP" -gt 0 ] 2>/dev/null || return 0
+
+  local old
+  # -maxdepth/-mindepth so this can only ever match a backup directory itself,
+  # never something inside one. `sort -r` on the timestamped names is a
+  # chronological sort: they are ISO-8601 basic format, which sorts lexically.
+  old="$(find "$dir" -mindepth 1 -maxdepth 1 -type d \
+           \( -name 'pre-upgrade-*' -o -name '20*T*Z' \) 2>/dev/null \
+         | sort -r | tail -n +$((BACKUP_KEEP + 1)))"
+  [ -n "$old" ] || return 0
+
+  local n=0
+  while IFS= read -r b; do
+    [ -n "$b" ] || continue
+    rm -rf -- "$b" && n=$((n + 1))
+  done <<EOF
+$old
+EOF
+  [ "$n" -gt 0 ] && say "removed $n old backup(s), keeping the newest $BACKUP_KEEP"
+  return 0
+}
+
+# Drop images no container references any more.
+#
+# `--filter dangling=true` is the conservative form: it removes only untagged
+# layers, which after a `compose pull` is exactly the previous release's web and
+# api images and nothing else. It cannot touch an image a container still uses,
+# and it cannot touch a tagged image, so a rollback to the tag we came from
+# still finds what it needs — which is why this runs only after the health check
+# has passed and rollback is off the table.
+prune_images() {
+  local before after freed
+  before="$(docker system df --format '{{.Type}}\t{{.Reclaimable}}' 2>/dev/null | awk -F'\t' '$1=="Images"{print $2}')"
+  docker image prune -f >/dev/null 2>&1 || {
+    warn "could not prune old images — not fatal, but disk use will keep growing"
+    return 0
+  }
+  after="$(docker system df --format '{{.Type}}\t{{.Reclaimable}}' 2>/dev/null | awk -F'\t' '$1=="Images"{print $2}')"
+  freed="${before:-?} → ${after:-?}"
+  say "removed the previous release's images (reclaimable: $freed)"
+  return 0
 }
 
 # Confirm the image we just pulled is the one the signed release names.
@@ -1127,6 +1239,9 @@ do_upgrade() {
       do_backup "$backup_dir" >/dev/null
       say "backup written to $backup_dir"
     fi
+    # Bound the set immediately: the backup that just landed is the one that
+    # pushes the oldest past the retention count.
+    prune_backups
     step_done backup
   fi
 
@@ -1169,6 +1284,12 @@ do_upgrade() {
     warn "expected version $TARGET_VERSION but the API reports $after"
   fi
   step_done health
+
+  # Only now: up to this point rollback_to may still need the image we came
+  # from, and pruning is what would have taken it away.
+  step cleanup "Reclaiming disk space"
+  prune_images
+  step_done cleanup
 
   # Safe now: this script has finished reading itself.
   if [ -f install.sh.new ]; then
@@ -1413,7 +1534,14 @@ EOF
 
   derive_topology
 
+  # The image tags are floating (":selfhost"), moved to the newest release by
+  # every publish — `up -d` alone only pulls an image that is missing outright,
+  # so a tag already cached locally from an earlier attempt on this host would
+  # otherwise be reused silently instead of refetched, leaving a fresh install
+  # running whatever version happened to be current the last time anything on
+  # this machine pulled it.
   say "starting the stack (first run downloads images and can take a few minutes)"
+  $COMPOSE pull || warn "could not pull — continuing with the images already on this machine"
   $COMPOSE up -d
   reload_caddy
 
