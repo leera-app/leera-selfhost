@@ -69,6 +69,15 @@
 		reverse_proxy api:8081
 	}
 
+	# OAuth discovery for the MCP endpoint (`domain::oauth`). RFC 8414 and
+	# RFC 9728 fix these at the well-known root, so like /mcp they cannot live
+	# under /api. Prefix, so the path-qualified form Claude probes first
+	# (/.well-known/oauth-protected-resource/mcp) lands here too. Everything
+	# else OAuth is under /api/v1/oauth/ and already reaches the API below.
+	handle /.well-known/oauth-* {
+		reverse_proxy api:8081
+	}
+
 	handle /api/* {
 		# flush_interval -1 disables response buffering so AI SSE streams
 		# reach the browser token by token. WebSockets upgrade natively.
