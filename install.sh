@@ -496,8 +496,10 @@ require_install() {
   fi
 
   cd "$INSTALL_DIR"
-  # Before any compose command in any subcommand: which stack is this?
+  # Before any compose command in any subcommand: which stack is this, and
+  # where does the host keep it?
   pin_project_name
+  pin_host_install_dir
 }
 
 # ── Topology (which containers run) ──────────────────────────────────────────
@@ -575,6 +577,34 @@ pin_project_name() {
     say "recorded this install as compose project '$name'"
   fi
   export COMPOSE_PROJECT_NAME="$name"
+}
+
+# Record the install directory as the *host* sees it.
+#
+# Compose resolves a relative bind mount against the directory it runs in, but
+# the daemon resolves the result against the host filesystem. Those are the same
+# place when an operator runs compose themselves, and are not when the updater
+# container runs it: there the directory is /install, which does not exist on
+# the host. The daemon then auto-creates it — as a *directory* — and the mount
+# either fails loudly (Caddyfile: a directory onto a file) or succeeds against
+# an empty one, which is worse. `./secrets` did the latter, so an update driven
+# from the UI could bring the API up with no secret key and report success.
+#
+# So the compose file mounts ${LEERA_HOST_INSTALL_DIR}/… and this pins the value
+# once, in .env, where compose reads it from either context.
+#
+# Never recomputed from $INSTALL_DIR when it is already set: inside the updater
+# that would rewrite the correct host path with /install and break the *next*
+# update instead of this one.
+pin_host_install_dir() {
+  local dir="${LEERA_HOST_INSTALL_DIR:-}"
+  [ -n "$dir" ] || { env_has LEERA_HOST_INSTALL_DIR && dir="$(env_get LEERA_HOST_INSTALL_DIR)"; }
+  if [ -z "$dir" ]; then
+    dir="$INSTALL_DIR"
+    say "recorded the host install directory as '$dir'"
+  fi
+  env_set LEERA_HOST_INSTALL_DIR "$dir"
+  export LEERA_HOST_INSTALL_DIR="$dir"
 }
 
 # Every install before external-DB/storage support ran the bundled Postgres and
@@ -1647,6 +1677,7 @@ EOF
   # Fresh installs get this from the generated .env; a re-run over an install
   # that predates the key is where it gets recorded.
   pin_project_name
+  pin_host_install_dir
 
   backfill_modes
 

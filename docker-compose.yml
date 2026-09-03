@@ -69,7 +69,7 @@ services:
       # stores. It has to be a separate file rather than a conditional block:
       # Caddy resolves upstreams lazily, so a route pointing at an absent
       # `minio` would return 502s instead of falling through to the web app.
-      - ./${LEERA_CADDYFILE:-Caddyfile}:/etc/caddy/Caddyfile:ro
+      - ${LEERA_HOST_INSTALL_DIR:-.}/${LEERA_CADDYFILE:-Caddyfile}:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
       # The update progress page, written by the updater. Read-only, and served
@@ -142,7 +142,7 @@ services:
       - leera_data:/data
       # Private-CA bundle for an external Postgres, when the operator supplies
       # one. Absent on a default install; `:ro` and never written to.
-      - ./secrets:/secrets:ro
+      - ${LEERA_HOST_INSTALL_DIR:-.}/secrets:/secrets:ro
     # `required: false` is what lets the bundled services be switched off by
     # profile: without it Compose rejects the whole project with "api depends
     # on undefined service db" whenever the profile is inactive.
@@ -209,7 +209,7 @@ services:
       RUST_LOG: info
     volumes:
       - leera_data:/data
-      - ./secrets:/secrets:ro
+      - ${LEERA_HOST_INSTALL_DIR:-.}/secrets:/secrets:ro
       # Caddy's certificate store, read-only, so STARTTLS uses the instance's
       # real certificate instead of a self-signed one. Requires the MX hostname
       # to be in the Caddy site list — install.sh adds it.
@@ -233,7 +233,7 @@ services:
       ENVIRONMENT: production
       MIGRATE_CONFIRM_PROD: "yes"
     volumes:
-      - ./secrets:/secrets:ro
+      - ${LEERA_HOST_INSTALL_DIR:-.}/secrets:/secrets:ro
     depends_on:
       db:
         condition: service_healthy
@@ -269,16 +269,21 @@ services:
       # Bind mounts requested from inside this container are resolved by the
       # daemon against the *host* filesystem, not against this container's.
       # install.sh uses this to translate its own paths before handing them to
-      # `docker run -v` — without it, a backup taken from the UI would mirror
-      # object storage into a directory that does not exist on the host.
-      # Compose expands ${PWD} to the install directory it was invoked from.
-      LEERA_HOST_INSTALL_DIR: ${PWD}
+      # `docker run -v`, and every relative mount in this file is written
+      # against it for the same reason.
+      #
+      # NOT ${PWD}: when compose runs inside this container the working
+      # directory is /install, so re-deriving it here would hand the recreated
+      # updater a path that does not exist on the host and break the *next*
+      # update. install.sh pins the real value in .env (pin_host_install_dir);
+      # the ${PWD} fallback only covers a first `up` that somehow precedes it.
+      LEERA_HOST_INSTALL_DIR: ${LEERA_HOST_INSTALL_DIR:-${PWD}}
     volumes:
       # Root on this host. Everything above is why that is acceptable.
       - /var/run/docker.sock:/var/run/docker.sock
       # The install directory: docker-compose.yml, .env, and install.sh, which
       # is the only program this container ever runs.
-      - ./:/install
+      - ${LEERA_HOST_INSTALL_DIR:-.}/:/install
       # Shared with the api container: the request file it writes, and the
       # result file it reads back. Deliberately NOT the directory Caddy
       # serves — /data also holds secret_key.
