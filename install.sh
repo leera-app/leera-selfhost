@@ -37,7 +37,6 @@
 
 set -euo pipefail
 
-INSTALL_DIR="${LEERA_HOME:-$HOME/leera}"
 # The public distribution repo — this source repo is private, so customers can
 # never fetch from it. Files live at the root of the dist repo, not under
 # deploy/selfhost/. Kept in sync by the release workflow's publish-bundle job.
@@ -53,6 +52,24 @@ COMPOSE="docker compose"
 SCRIPT_DIR=""
 if [ -n "${BASH_SOURCE[0]:-}" ]; then
   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || true)"
+fi
+
+# Where the install lives. LEERA_HOME wins; otherwise the directory this script
+# is sitting in, but only when that directory is itself an install — both files
+# have to be there, so a checkout (docker-compose.yml, no .env) still installs
+# to $HOME/leera and a `curl … | bash` (no SCRIPT_DIR at all) still does too.
+#
+# The "sitting in" case is what makes `sudo ./install.sh --upgrade` work.
+# Without it sudo resolves $HOME to /root, and the script says "no install found
+# in /root/leera" while standing in the install directory — which is a confusing
+# thing to be told, and the reflex it provokes (rerun with sudo) is the reflex
+# that produced the root-owned files in the first place.
+if [ -n "${LEERA_HOME:-}" ]; then
+  INSTALL_DIR="$LEERA_HOME"
+elif [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/.env" ] && [ -f "$SCRIPT_DIR/docker-compose.yml" ]; then
+  INSTALL_DIR="$SCRIPT_DIR"
+else
+  INSTALL_DIR="$HOME/leera"
 fi
 
 # Upgrade options, set by the dispatcher at the bottom.
@@ -102,12 +119,22 @@ fail() {
 # Compose names volumes "<project>_<volume>", and derives the project from the
 # directory it runs in: lowercased, with everything outside [a-z0-9_-] dropped.
 # Mirrored here so a volume can be looked for before compose is invoked.
+#
+# The directory has to be the one on the *host*: inside the updater container
+# this script runs from a bind mount at /install, which is nobody's project.
+# See pin_project_name for what that cost.
 compose_project_name() {
   if [ -n "${COMPOSE_PROJECT_NAME:-}" ]; then
     printf '%s' "$COMPOSE_PROJECT_NAME"
   else
-    basename "$INSTALL_DIR" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-'
+    sanitize_project_name "$(basename "$(host_path "$INSTALL_DIR")")"
   fi
+}
+
+# Compose's own normalisation, plus the leading-character rule it enforces
+# separately: a project name has to start with a letter or a digit.
+sanitize_project_name() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-' | sed 's/^[^a-z0-9]*//'
 }
 
 # Named stages, so the browser can draw a checklist instead of a log. The keys
@@ -452,7 +479,25 @@ reclaim_path() {
 
 require_install() {
   [ -f "$INSTALL_DIR/.env" ] || fail "no install found in $INSTALL_DIR — run install.sh first"
+
+  # An update performed from the admin UI runs this script as root inside the
+  # updater container, and .env is rewritten by replacing it — so it comes back
+  # owned by root, on a file the operator's own user then cannot read. Left to
+  # itself that surfaces as a bare "grep: .env: Permission denied" from three
+  # different places and no indication of what to do about it.
+  if [ ! -r "$INSTALL_DIR/.env" ] || [ ! -w "$INSTALL_DIR/.env" ]; then
+    fail "$INSTALL_DIR/.env is not readable and writable by $(id -un).
+        An update run from the admin UI leaves it owned by root. Take it back:
+
+            sudo chown -R $(id -un):$(id -gn) $INSTALL_DIR
+
+        Then run this again as yourself. Running it under sudo instead would
+        work, and would leave these files owned by root all over again."
+  fi
+
   cd "$INSTALL_DIR"
+  # Before any compose command in any subcommand: which stack is this?
+  pin_project_name
 }
 
 # ── Topology (which containers run) ──────────────────────────────────────────
@@ -475,6 +520,62 @@ env_set() {
 # True when .env defines KEY at all (even as empty). Distinct from "is non-empty"
 # because an empty value is meaningful for the endpoint and TLS keys.
 env_has() { [ -f .env ] && grep -q "^${1}=" .env; }
+
+# The value of KEY in .env, empty when unset. env_set keeps one line per key;
+# the tail is there for a file an operator has edited by hand.
+env_get() { [ -f .env ] && sed -n "s/^${1}=//p" .env | tail -1; }
+
+# The compose project the running stack is already filed under, asked of Docker
+# rather than guessed from a path. Empty when none of it is up.
+#
+# Authoritative in a way that deriving from a directory is not: these container
+# names are fixed in docker-compose.yml, so whichever project owns them is the
+# project this install actually is.
+running_project_name() {
+  local c name
+  for c in leera-selfhost-api leera-selfhost-db leera-selfhost-caddy \
+           leera-selfhost-web leera-selfhost-updater; do
+    name="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' \
+      "$c" 2>/dev/null || true)"
+    [ -n "$name" ] && { printf '%s' "$name"; return 0; }
+  done
+  return 0
+}
+
+# Pin the compose project name in .env, so both ways of starting an upgrade
+# address the same stack.
+#
+# Compose derives the project from the directory it runs in, and that directory
+# is not the same on the two paths. An operator runs this from the install
+# directory, so the project is (say) "leera". The updater container runs the
+# very same script from its bind mount, so the project is "install" — a second,
+# empty project laid over the same files. `compose pull` does not care about
+# projects, which is exactly why the download and verify steps still passed;
+# then `compose up -d migrate` went to create that second project's containers
+# and collided with the running stack's fixed container_names. What the operator
+# saw was "the database migrator could not be started" and an empty
+# `compose logs migrate` — empty because in project "install" there is no such
+# container to have logs.
+#
+# The collision is the only thing that kept this from being much worse. Without
+# the fixed names, an update from the admin UI would have brought a second stack
+# up on fresh, empty volumes beside the real data.
+#
+# .env is where compose reads the name on both paths. An existing install keeps
+# whatever name its containers already carry: recomputing it from a path could
+# rename a live stack and orphan every volume it has.
+pin_project_name() {
+  local name=""
+  env_has COMPOSE_PROJECT_NAME && name="$(env_get COMPOSE_PROJECT_NAME)"
+  if [ -z "$name" ]; then
+    name="$(running_project_name)"
+    [ -n "$name" ] || name="$(compose_project_name)"
+    [ -n "$name" ] || name=leera
+    env_set COMPOSE_PROJECT_NAME "$name"
+    say "recorded this install as compose project '$name'"
+  fi
+  export COMPOSE_PROJECT_NAME="$name"
+}
 
 # Every install before external-DB/storage support ran the bundled Postgres and
 # MinIO, so an .env without the mode keys must mean "bundled" for both. Getting
@@ -1147,8 +1248,17 @@ check_digest() {
 # visible stage rather than something hidden inside a dependency condition.
 run_migrations() {
   step migrate "Updating the database"
-  $COMPOSE up -d migrate >/dev/null 2>&1 \
-    || fail "the database migrator could not be started. Check: $COMPOSE logs migrate"
+
+  # Not silenced. When `up` refuses, its own stderr is the only thing that says
+  # why, and the obvious next command cannot say it: a container that was never
+  # created has no logs, so "check compose logs migrate" sent operators to an
+  # empty page. Discarding this line is what turned a fixable misconfiguration
+  # into a dead end.
+  local up_out
+  if ! up_out="$($COMPOSE up -d migrate 2>&1)"; then
+    fail "the database migrator could not be started. Nothing has been changed.
+        Compose said: $(printf '%s' "$up_out" | grep -v '^ *$' | tail -n 3)"
+  fi
 
   local state code
   for _ in $(seq 1 900); do
@@ -1467,6 +1577,13 @@ MINIO_ROOT_PASSWORD=$(openssl rand -hex 24)
 LEERA_IMAGE_REPO=${LEERA_IMAGE_REPO:-ghcr.io/leera-app}
 LEERA_VERSION=${LEERA_VERSION:-selfhost}
 
+# The compose project this stack is filed under. Pinned rather than left to
+# compose's default of "the directory name", because the updater container runs
+# install.sh from its own bind mount: without this, an update from the admin UI
+# would address a different project than an update over SSH, and find none of
+# these containers or volumes. Changing it after install orphans both.
+COMPOSE_PROJECT_NAME=$(compose_project_name)
+
 # What this instance brings its own of: 'bundled' or 'external'. These decide
 # which containers run — install.sh turns them into COMPOSE_PROFILES below.
 LEERA_DB_MODE=${LEERA_DB_MODE:-bundled}
@@ -1526,6 +1643,10 @@ EOF
   else
     say "existing .env found — keeping current secrets"
   fi
+
+  # Fresh installs get this from the generated .env; a re-run over an install
+  # that predates the key is where it gets recorded.
+  pin_project_name
 
   backfill_modes
 

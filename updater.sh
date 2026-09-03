@@ -44,6 +44,27 @@ log() { printf '[leera-updater] %s\n' "$*" >&2; }
 
 mkdir -p "$UPDATE_DIR" "$DOCROOT"
 
+# Which compose project the stack is filed under.
+#
+# Asked of Docker, because this container has no way to see the host directory
+# compose would otherwise name it after. .env wins when it records the name —
+# that is the value install.sh pins and the one an operator can correct — and
+# the running containers answer for an install whose .env predates it.
+stack_project_name() {
+  local name
+  name="$(sed -n 's/^COMPOSE_PROJECT_NAME=//p' "$INSTALL_DIR/.env" 2>/dev/null | tail -1)"
+  if [ -z "$name" ]; then
+    local c
+    for c in leera-selfhost-api leera-selfhost-db leera-selfhost-caddy \
+             leera-selfhost-web leera-selfhost-updater; do
+      name="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' \
+        "$c" 2>/dev/null || true)"
+      [ -n "$name" ] && break
+    done
+  fi
+  printf '%s' "$name"
+}
+
 # ── Progress page ─────────────────────────────────────────────────────────────
 
 # The instance's own product name, for the progress page.
@@ -274,14 +295,28 @@ run_update() {
   # LEERA_DIGEST_* are checked after the pull: a tag that moved between the
   # signed manifest and the registry fails the update instead of quietly
   # installing something else.
+  # COMPOSE_PROJECT_NAME is the one thing this container cannot let compose
+  # work out for itself. Compose derives the project from the directory it runs
+  # in, and here that is /install — not the host directory the stack was
+  # created from. Left alone it addresses an empty project, so `up` collides
+  # with the running containers by name and the update dies at the migrator.
+  # install.sh pins this in .env, and this is the belt to that pair of braces:
+  # it also covers an install whose .env predates that key.
+  # Passed as an array so an unanswerable project name stays *unset* rather
+  # than set-to-empty: an empty COMPOSE_PROJECT_NAME in the environment would
+  # take precedence over the correct one in .env.
+  local env_args=("LEERA_HOME=$INSTALL_DIR"
+                  "LEERA_DIGEST_API=$digest_api"
+                  "LEERA_DIGEST_WEB=$digest_web")
+  local project
+  project="$(stack_project_name)"
+  [ -n "$project" ] && env_args+=("COMPOSE_PROJECT_NAME=$project")
+
   while IFS= read -r line; do
     handle_line "$line"
   done < <(
     cd "$INSTALL_DIR" || exit 1
-    LEERA_HOME="$INSTALL_DIR" \
-    LEERA_DIGEST_API="$digest_api" \
-    LEERA_DIGEST_WEB="$digest_web" \
-      bash ./install.sh "${args[@]}" 2>&1
+    env "${env_args[@]}" bash ./install.sh "${args[@]}" 2>&1
     printf '__EXIT__ %s\n' "$?"
   )
 

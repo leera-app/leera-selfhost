@@ -6,6 +6,7 @@
 # One public origin for everything:
 #   /api/*           -> Rust API   (WebSocket upgrades pass through; SSE unbuffered)
 #   /ai/sse          -> Rust API   (AI stream; exact path — /ai/* is web pages)
+#   /mcp*            -> Rust API   (MCP endpoint for AI clients)
 #   /_leera/update/* -> updater    (the one route that outlives an update)
 #   /storage/*       -> MinIO      (path-style bucket "storage"; prefix NOT stripped,
 #                                   it is part of the SigV4-signed URL)
@@ -57,6 +58,15 @@
 		reverse_proxy api:8081 {
 			flush_interval -1
 		}
+	}
+
+	# The MCP endpoint, for AI clients (Claude, Cursor) connecting to this
+	# instance. Like /ai/sse it lives at the API root rather than under /api:
+	# MCP clients are given one URL to paste, and `https://<host>/mcp` is the
+	# conventional shape. Prefix rather than exact, so a client that appends a
+	# trailing slash still lands on the API instead of the web app's 404.
+	handle /mcp* {
+		reverse_proxy api:8081
 	}
 
 	handle /api/* {
