@@ -75,9 +75,14 @@ stack_project_name() {
 # to something unbranded rather than to the vendor's name: a whitelabelled
 # instance showing "Updating Leera" mid-update gives the whole thing away.
 progress_app_name() {
-  local name
-  name="$(curl -fsS --max-time 5 http://api:8081/api/v1/instance/public_config/ 2>/dev/null \
-    | jq -r '(.data // .).branding.app_name // empty' 2>/dev/null)"
+  local name body url=http://api:8081/api/v1/instance/public_config/
+  # Older updater images have no curl; BusyBox wget is always there.
+  if command -v curl >/dev/null 2>&1; then
+    body="$(curl -fsS --max-time 5 "$url" 2>/dev/null)"
+  else
+    body="$(wget -q -T 5 -O - "$url" 2>/dev/null)"
+  fi
+  name="$(jq -r '(.data // .).branding.app_name // empty' 2>/dev/null <<<"$body")"
   # The name lands in HTML, so drop the characters that could close a tag.
   name="$(printf '%s' "$name" | tr -d '<>&"' | cut -c1-60)"
   [ -n "$name" ] && printf '%s' "$name" || printf 'the app'

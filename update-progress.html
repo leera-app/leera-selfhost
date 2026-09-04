@@ -110,15 +110,29 @@
     setInterval(poll, 2000);
   }
 
+  // Failed polls in a row. The reverse proxy is recreated during the restart
+  // step and is back within seconds; a page that has heard nothing for well
+  // over a minute is not looking at a restart, it is looking at a proxy that
+  // did not come back — and it should say so rather than spin forever.
+  let misses = 0;
+  const LOST_AFTER = 45;                         // × 2 s
+
   async function poll() {
     if (settled) return;
     try {
       const res = await fetch(`./${token}.json`, { cache: 'no-store' });
       if (!res.ok) return;                       // not written yet
+      misses = 0;
       render(await res.json());
     } catch {
       // The API and web app are restarting; this page is static, so a failed
-      // poll means "not yet", never "something is wrong".
+      // poll means "not yet" — until it has meant that for too long.
+      if (++misses === LOST_AFTER) {
+        el('subtitle').textContent =
+          'This page can no longer reach the server. The update may have ' +
+          'finished or failed without being able to say so here. On the ' +
+          'server, run: ./install.sh --status';
+      }
     }
   }
 

@@ -171,12 +171,36 @@ step_done() {
 #
 # --retry covers the other half: a transient failure on the last address should
 # start the list over rather than abort an install.
+#
+# wget is the fallback because the updater image is Alpine, whose BusyBox
+# carries wget and nothing else: older updater images have no curl at all, and
+# with curl-only fetching every download inside them failed — silently, via the
+# best-effort branch in refresh_bundle — so the stack files never refreshed and
+# a UI update recreated caddy from a compose file the host could not mount.
 fetch() {
-  curl -fsSL \
-    --connect-timeout 10 \
-    --max-time 120 \
-    --retry 3 --retry-delay 2 --retry-connrefused \
-    "$@"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL \
+      --connect-timeout 10 \
+      --max-time 120 \
+      --retry 3 --retry-delay 2 --retry-connrefused \
+      "$@"
+    return
+  fi
+  # Only the `URL -o FILE` form is used in this script; translate it.
+  local url="" dest="-"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -o) dest="$2"; shift ;;
+      *)  url="$1" ;;
+    esac
+    shift
+  done
+  wget -q -T 30 -O "$dest" "$url"
+}
+
+require_downloader() {
+  command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 \
+    || fail "neither curl nor wget is installed, so the stack files cannot be downloaded from $RAW_BASE"
 }
 
 # Fetch one bundle file, announcing it first. The announcement is the whole
@@ -1098,17 +1122,33 @@ recorded_hash() {
 refresh_bundle() {
   step bundle "Fetching the new stack files"
 
-  local tmp f current recorded changed=0
+  local tmp f current recorded changed=0 fetched=0 missing=""
   tmp="$(mktemp -d)"
   # shellcheck disable=SC2064
   trap "rm -rf '$tmp'" RETURN
+
+  require_downloader
 
   # Best-effort per file: a bundle file that cannot be fetched leaves the
   # current one in place, so fetch() rather than fetch_bundle_file(), which
   # treats a failure as fatal.
   for f in $BUNDLE_FILES install.sh; do
-    fetch "$RAW_BASE/$f" -o "$tmp/$f" 2>/dev/null || rm -f "$tmp/$f"
+    if fetch "$RAW_BASE/$f" -o "$tmp/$f" 2>/dev/null; then
+      fetched=$((fetched + 1))
+    else
+      rm -f "$tmp/$f"
+      missing="$missing $f"
+    fi
   done
+  # Not one file: that is not "already current", it is a download that did
+  # not happen — and the update that follows relies on these files matching
+  # the release. An update from the admin UI in particular needs the compose
+  # file this bundle ships, because it runs compose from inside a container
+  # where the previous file's relative mounts point at paths the host lacks.
+  [ "$fetched" -gt 0 ] || fail "could not download the stack files from $RAW_BASE.
+        Nothing has been changed. Check that this machine can reach
+        raw.githubusercontent.com, then update again."
+  [ -z "$missing" ] || warn "could not download:$missing — keeping the current copies"
 
   for f in $BUNDLE_FILES; do
     [ -f "$tmp/$f" ] || continue
@@ -1311,13 +1351,38 @@ run_migrations() {
 # Put the previous version back. Images only: migrations are not reversible,
 # which is why the pre-update backup is taken and why that is said plainly.
 rollback_to() {
-  local tag="$1" backup="$2"
+  local tag="$1" backup="$2" up_out=""
   warn "rolling back to $tag"
   env_set LEERA_VERSION "$tag"
-  $COMPOSE up -d caddy web api >/dev/null 2>&1 || true
+  # Not silenced: when this fails, compose's own line is the only thing that
+  # says why — and it is the same line that just failed the update.
+  if ! up_out="$($COMPOSE up -d caddy web api 2>&1)"; then
+    warn "putting the previous version back did not fully succeed.
+        Compose said: $(printf '%s' "$up_out" | grep -v '^ *$' | tail -n 3)"
+  fi
   reload_caddy
 
   if wait_for_api; then
+    # The API answering is not the same as the rollback having taken. When
+    # compose gave up before recreating api, the API that answers is the new
+    # one, and the reverse proxy may not be running at all — this instance
+    # once reported "put back on its previous version" with the new version
+    # serving and caddy dead, so the site was down.
+    local got want="${tag#selfhost-}"
+    got="$(api_version)"
+    if [ "$want" != "$tag" ] && [ -n "$got" ] && [ "$got" != "$want" ]; then
+      fail "the update failed, and putting the previous version back did not take:
+        the API reports version $got rather than $want. Restore the pre-update
+        backup, or bring the stack up by hand:
+            ./install.sh --restore $backup
+            $COMPOSE up -d
+        Then check: $COMPOSE ps"
+    fi
+    if ! $COMPOSE ps --status running --services 2>/dev/null | grep -qx caddy; then
+      fail "the update failed, and the reverse proxy is not running, so the site is
+        unreachable until it is. Check: $COMPOSE logs caddy
+        Then: $COMPOSE up -d caddy"
+    fi
     fail "the update failed and this instance was put back on its previous version.
         Database changes made by the new version are not undone. If anything looks
         wrong, restore the pre-update backup:
