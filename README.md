@@ -28,45 +28,16 @@ API, PostgreSQL, object storage, and a reverse proxy with automatic HTTPS.
   operational logs on a retention schedule. Your own data — tickets, documents,
   uploads — is the only thing that grows, which is as it should be.
 
-## Install
+## Install with an AI agent
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/leera-app/leera-selfhost/main/install.sh | bash
-```
+The shortest path in, if you have an agent that can run commands on your
+machine — Claude Code, Cursor, Codex, anything with terminal access. Paste the
+prompt below and it asks where you want Leera, provisions the server, points
+DNS at it, waits for DNS to actually resolve, runs the installer, and checks
+that the result really serves HTTPS before telling you it is done.
 
-On a bare server that is the only command: Docker is installed first (via
-Docker's own install script), the daemon is started and enabled at boot, and
-your user is added to the `docker` group. That group only takes effect at your
-next login, so the rest of *this* run goes through `sudo` — nothing to do about
-it, and nothing to log out for.
-
-Add `LEERA_INSTALL_DOCKER=yes` to answer the Docker question up front for an
-unattended install, or `LEERA_INSTALL_DOCKER=no` to install Docker yourself.
-
-You will be asked for a domain. Enter one (e.g. `pm.example.com`) for automatic
-HTTPS via Let's Encrypt, or leave it blank for plain HTTP on `http://localhost`
-— fine for evaluating on a laptop or LAN.
-
-For an unattended install, set the domain up front:
-
-```bash
-LEERA_DOMAIN=pm.example.com bash -c "$(curl -fsSL https://raw.githubusercontent.com/leera-app/leera-selfhost/main/install.sh)"
-```
-
-The first run downloads images and can take a few minutes. When it finishes,
-open the URL it prints — **the first account created becomes the administrator.**
-
-Everything lives in `~/leera` (override with `LEERA_HOME`): the generated
-`.env` holding your secrets, plus the compose file and Caddyfile.
-
-## Or let an AI agent do the whole thing
-
-If you would rather not stand up a server by hand, paste the prompt below into
-an agent that can run commands on your machine — Claude Code, Cursor, Codex,
-anything with terminal access. It asks where you want Leera, provisions the
-server, points DNS at it, waits for DNS to actually resolve, runs this
-installer, and checks that the result really serves HTTPS before telling you
-it is done.
+Already have a server? [Install it yourself](#install-it-yourself) is one
+command, and is what this prompt automates.
 
 Two things worth knowing first. The agent acts with **your** cloud credentials
 on **your** account, so read the plan it shows you — it prices the resources
@@ -156,9 +127,40 @@ Do not work around it, and do not quietly give up. Tell me:
 Then wait for me. A stalled install I can finish beats a half-built one.
 ````
 
-Nothing in that prompt is privileged: it is the manual process above, written
-out. If you prefer to read before you run, everything it does is documented on
-this page.
+Nothing in that prompt is privileged: it is the manual install below, written
+out in the order it has to happen. If you would rather read before you run,
+every step of it is documented on this page.
+
+## Install it yourself
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/leera-app/leera-selfhost/main/install.sh | bash
+```
+
+On a bare server that is the only command: Docker is installed first (via
+Docker's own install script), the daemon is started and enabled at boot, and
+your user is added to the `docker` group. That group only takes effect at your
+next login, so the rest of *this* run goes through `sudo` — nothing to do about
+it, and nothing to log out for.
+
+Add `LEERA_INSTALL_DOCKER=yes` to answer the Docker question up front for an
+unattended install, or `LEERA_INSTALL_DOCKER=no` to install Docker yourself.
+
+You will be asked for a domain. Enter one (e.g. `pm.example.com`) for automatic
+HTTPS via Let's Encrypt, or leave it blank for plain HTTP on `http://localhost`
+— fine for evaluating on a laptop or LAN.
+
+For an unattended install, set the domain up front:
+
+```bash
+LEERA_DOMAIN=pm.example.com bash -c "$(curl -fsSL https://raw.githubusercontent.com/leera-app/leera-selfhost/main/install.sh)"
+```
+
+The first run downloads images and can take a few minutes. When it finishes,
+open the URL it prints — **the first account created becomes the administrator.**
+
+Everything lives in `~/leera` (override with `LEERA_HOME`): the generated
+`.env` holding your secrets, plus the compose file and Caddyfile.
 
 ## Back up before you have data worth losing
 
