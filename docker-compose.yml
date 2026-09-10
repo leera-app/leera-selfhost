@@ -89,6 +89,11 @@ services:
     environment:
       # SSR / Server Actions reach the API over the internal network.
       SERVER_URL_INTERNAL: http://api:8081
+      # Server-rendering faults. The same switch as the API's, because an
+      # operator turning reporting off means the whole install, not one
+      # container — and the browser half follows the API's answer already.
+      LEERA_ERROR_REPORTING: ${LEERA_ERROR_REPORTING-on}
+      ENVIRONMENT: production
     depends_on:
       - api
 
@@ -137,6 +142,10 @@ services:
       # Shapes what the Updates page says when it cannot install an update
       # itself: the fallback instructions have to match how this was deployed.
       LEERA_DEPLOY_KIND: compose
+      # Crash reports. On unless the operator says otherwise; the License page
+      # in the admin UI enumerates exactly what one contains. `-` not `:-`, so
+      # an explicitly empty value still reaches the container as empty.
+      LEERA_ERROR_REPORTING: ${LEERA_ERROR_REPORTING-on}
       RUST_LOG: info
     volumes:
       - leera_data:/data
@@ -196,6 +205,9 @@ services:
       <<: *pg-env
       MX_BIND: 0.0.0.0:2525
       ENVIRONMENT: production
+      # Same switch as the API. This process fails in its own ways — a TLS
+      # handshake, a spool write — and none of them are visible from the API.
+      LEERA_ERROR_REPORTING: ${LEERA_ERROR_REPORTING-on}
       SECRET_KEY_FILE: /data/secret_key
       # Object storage: raw messages are spooled here before the SMTP session
       # returns 250, and the API worker reads them back to build tickets.
