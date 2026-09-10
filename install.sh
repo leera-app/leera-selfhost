@@ -26,6 +26,12 @@
 # on macOS. It asks first; LEERA_INSTALL_DOCKER=yes answers yes ahead of time
 # for unattended installs, LEERA_INSTALL_DOCKER=no declines and stops.
 #
+# If ports 80/443 already belong to a reverse proxy you run yourself, this asks
+# and records LEERA_PROXY_MODE=external: Caddy moves to LEERA_PROXY_BIND
+# (127.0.0.1:8080) and keeps routing, while your proxy terminates TLS in front
+# of it. Set LEERA_PROXY_MODE up front to answer ahead of time. An install in
+# that mode writes nginx-leera.conf here, ready to drop into nginx.
+#
 # A "complete" backup is three things — database dump, secret key, and .env.
 # Any one of them missing makes the other two useless, which is why backup and
 # restore are commands here rather than instructions in a document.
@@ -649,6 +655,22 @@ backfill_modes() {
   if ! env_has LEERA_UPDATER; then
     env_set LEERA_UPDATER on
   fi
+  # Every install predating external-proxy support ran the bundled Caddy on 80/443,
+  # because that was the only thing the stack could do. Anything else would change
+  # where a working install listens on its next upgrade.
+  if ! env_has LEERA_PROXY_MODE; then
+    env_set LEERA_PROXY_MODE bundled
+  fi
+  # Only read in external mode. Recorded regardless so an operator moving an install
+  # behind a proxy has the knob in front of them, already at a sane value.
+  #
+  # Loopback by default: it is what keeps "the API is unreachable from outside, so
+  # forwarded headers can only arrive through the proxy" true. An operator whose own
+  # proxy runs in a container (where a host loopback port is unreachable) sets this
+  # to 0.0.0.0:8080 or attaches their proxy to this project's network.
+  if ! env_has LEERA_PROXY_BIND; then
+    env_set LEERA_PROXY_BIND 127.0.0.1:8080
+  fi
 }
 
 # Translate a path in *this* filesystem to the equivalent on the Docker host.
@@ -673,6 +695,11 @@ derive_topology() {
   local db_mode="${LEERA_DB_MODE:-bundled}"
   local storage_mode="${LEERA_STORAGE_MODE:-bundled}"
   local profiles="" caddyfile="Caddyfile"
+  # What .env said before this function overwrites it. The list built below is
+  # derived purely from the mode keys, so it can never contain `mx` — that profile
+  # only ever arrives by an operator editing COMPOSE_PROFILES by hand, and the
+  # warning at the end has to look at what they wrote, not at what we computed.
+  local prior_profiles="${COMPOSE_PROFILES:-}"
 
   case "$db_mode" in
     bundled)  profiles="db-bundled" ;;
@@ -692,6 +719,34 @@ derive_topology() {
     *) fail "LEERA_UPDATER must be 'on' or 'off' (got '${LEERA_UPDATER:-}')" ;;
   esac
 
+  # Who owns :80 and :443. In `external` the operator's own reverse proxy does, and
+  # Caddy moves to a loopback port behind it — still routing every path, just not
+  # holding the front door. See the header of Caddyfile for why Caddy stays in the
+  # picture at all rather than handing seven routes to somebody else's config.
+  local http_ports https_ports caddy_site
+  case "${LEERA_PROXY_MODE:-bundled}" in
+    bundled)
+      # These two must reproduce what the compose file said before these keys
+      # existed, byte for byte. `0.0.0.0:80:80` would not: it pins IPv4, where a
+      # bare `80:80` also binds IPv6 when the daemon has it on.
+      http_ports="80:80"
+      https_ports="443:443"
+      caddy_site="${LEERA_DOMAIN:-:80}"
+      ;;
+    external)
+      http_ports="${LEERA_PROXY_BIND:-127.0.0.1:8080}:80"
+      # Published but unreachable, and unused: compose cannot drop a port entry by
+      # profile, so it goes to loopback rather than being removed. Caddy serves no
+      # TLS in this mode — the proxy in front already terminated it.
+      https_ports="127.0.0.1:8443:443"
+      # A bare port, never a hostname. This is what stops Caddy attempting ACME:
+      # it cannot answer a challenge on ports it no longer holds, and a named site
+      # would have it retrying issuance forever.
+      caddy_site=":80"
+      ;;
+    *) fail "LEERA_PROXY_MODE must be 'bundled' or 'external' (got '${LEERA_PROXY_MODE:-}')" ;;
+  esac
+
   # `required: false` in docker-compose.yml is what lets the bundled services be
   # switched off — but it also makes a wrong profile fail OPEN: the project stays
   # valid and the API starts with no database, dying at runtime instead of here.
@@ -706,8 +761,208 @@ derive_topology() {
 
   env_set COMPOSE_PROFILES "$profiles"
   env_set LEERA_CADDYFILE "$caddyfile"
+  env_set LEERA_HTTP_PORTS "$http_ports"
+  env_set LEERA_HTTPS_PORTS "$https_ports"
+  env_set LEERA_CADDY_SITE "$caddy_site"
 
-  say "topology: database=$db_mode storage=$storage_mode (profiles: ${profiles:-none})"
+  # Inbound mail needs a certificate for the MX hostname, and in external mode
+  # nothing here issues one: Caddy is not doing ACME, so tls::acceptor finds no
+  # certificate, STARTTLS is never advertised, and mail is delivered in the clear —
+  # which is what gets a domain flagged by Google and Microsoft. Silent is the one
+  # thing that must not happen, so say so on every install and upgrade.
+  case ",$prior_profiles," in
+    *,mx,*)
+      if [ "${LEERA_PROXY_MODE:-bundled}" = "external" ]; then
+        warn "inbound email is enabled but this install sits behind your own reverse proxy,
+        so nothing here can obtain a certificate for the MX hostname. Mail would be
+        accepted WITHOUT encryption, which large providers penalise. Inbound email is
+        supported on a bundled install — run it on its own instance if you need it."
+      fi
+      ;;
+  esac
+
+  say "topology: database=$db_mode storage=$storage_mode proxy=${LEERA_PROXY_MODE:-bundled} (profiles: ${profiles:-none})"
+}
+
+# Is something already listening on this TCP port?
+#
+# 0 = yes, 1 = no, 2 = could not tell. The third answer is the point: this script
+# runs on whatever the operator happens to have, and a probe that guessed "free"
+# where it cannot see would hand them the compose error we are trying to replace.
+# Every caller treats 2 the same as "no" — act only on what we actually observed.
+#
+# No single tool is everywhere. The updater image is Alpine, whose BusyBox has
+# netstat but neither ss nor lsof; macOS has lsof and netstat but no ss. Same
+# command -v ladder as the interface probe in run_wizard, for the same reason.
+port_in_use() {
+  local port="$1"
+  # Column 4 is the local address, in any of `0.0.0.0:80`, `[::]:80`, `*:80` or
+  # macOS netstat's `*.80` — hence the [:.] rather than a colon.
+  if command -v ss >/dev/null 2>&1; then
+    if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${port}\$"; then return 0; fi
+    return 1
+  fi
+  if command -v lsof >/dev/null 2>&1; then
+    if lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then return 0; fi
+    return 1
+  fi
+  if command -v netstat >/dev/null 2>&1; then
+    if netstat -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${port}\$"; then return 0; fi
+    return 1
+  fi
+  return 2
+}
+
+# A best-effort name for whatever holds port 80, so the question below can say
+# "nginx" instead of "something". Empty is a fine answer; this never fails.
+listener_name() {
+  command -v curl >/dev/null 2>&1 || return 0
+  curl -sS -o /dev/null -D - --max-time 3 http://127.0.0.1/ 2>/dev/null \
+    | sed -n 's/^[Ss]erver: *//p' | tr -d '\r' | head -1
+}
+
+# Ask a yes/no question, with an explicit answer for every way there may be nobody
+# to ask. Mirrors confirm_docker_install's contract: the updater container first,
+# then /dev/tty rather than stdin — under `curl … | bash` stdin is the script body,
+# and reading it would swallow the rest of the file.
+#
+# $1 question, $2 answer to use when there is no one to ask (0 = yes, 1 = no).
+ask_yes_no() {
+  local question="$1" fallback="$2" reply=""
+  # Try to OPEN it, rather than trusting `[ -r /dev/tty ]`. The node can exist and
+  # look readable while the open still fails with "Device not configured" — every
+  # detached context does this — and the -r test would then wave us through to a
+  # printf and a read that both fail noisily before landing on the fallback anyway.
+  if [ "$JSON_PROGRESS" = "1" ] || ! { : < /dev/tty; } 2>/dev/null; then
+    say "$question — no terminal to ask on"
+    return "$fallback"
+  fi
+  printf '\033[1;35m[leera]\033[0m %s [Y/n] ' "$question" > /dev/tty
+  read -r reply < /dev/tty || reply=""
+  case "$reply" in ""|y|Y|yes|YES|Yes) return 0 ;; *) return 1 ;; esac
+}
+
+# Does this machine already have a reverse proxy in front of us?
+#
+# FRESH INSTALLS ONLY. On --upgrade the thing holding 80/443 is our own caddy, so
+# probing there would flip every healthy install to external mode on its next
+# upgrade. An existing install's mode lives in .env and nothing may change it
+# behind the operator's back.
+detect_external_proxy() {
+  local busy=""
+  if port_in_use 80;  then busy="80"; fi
+  if port_in_use 443; then busy="${busy:+$busy and }443"; fi
+  [ -n "$busy" ] || return 0
+
+  local wanted
+  wanted="${LEERA_PROXY_MODE:-}"
+  case "$wanted" in
+    external) return 0 ;;
+    bundled)
+      fail "port $busy is in use, but LEERA_PROXY_MODE=bundled means this install wants
+        to own it. Free the port, or set LEERA_PROXY_MODE=external to run behind the
+        server already there."
+      ;;
+  esac
+
+  local who question
+  who="$(listener_name)"
+  question="Port $busy is already in use${who:+, by $who}.
+        Are you putting Leera behind a reverse proxy you already run here?"
+
+  # Nobody to ask: take the external answer. On a fresh install a busy port 80 is
+  # strong evidence of an existing web server, and the alternative is exactly what
+  # happened to one customer — the stack cannot bind, compose rolls back, and the
+  # install is quietly abandoned half-finished.
+  #
+  # Note this is the opposite of confirm_docker_install's no-terminal default, and
+  # deliberately so: there, carrying on is the conservative answer; here, carrying
+  # on as bundled is the one thing that cannot work.
+  if ask_yes_no "$question" 0; then
+    export LEERA_PROXY_MODE=external
+    say "using your reverse proxy — Leera will listen on ${LEERA_PROXY_BIND:-127.0.0.1:8080}"
+  else
+    fail "port $busy is in use and a bundled install needs it.
+        Free the port and run this again, or re-run with LEERA_PROXY_MODE=external to
+        put Leera behind the server you already have there."
+  fi
+}
+
+# Mail is optional, so this warns rather than failing. Fresh installs only, and only
+# when the operator asked for mx: on an upgrade the thing holding 25 is our own
+# container. Worth saying because Ubuntu images so often ship postfix already
+# listening, and the alternative is an opaque compose error much later.
+check_mail_port() {
+  case ",${COMPOSE_PROFILES:-}," in
+    *,mx,*) ;;
+    *) return 0 ;;
+  esac
+  if port_in_use 25; then
+    warn "port 25 is already in use — Ubuntu images often ship postfix or exim running.
+        Inbound email will not start until that port is free."
+  fi
+}
+
+# Write the nginx server block for an external-proxy install, with this install's
+# domain and port already filled in.
+#
+# Generated rather than shipped: it is per-install, so it must NOT join
+# BUNDLE_FILES or record_bundle_hashes would report every install as drifted.
+#
+# Deliberately plain HTTP with no ssl_certificate lines. `certbot --nginx` rewrites
+# this block to add the certificate and the redirect, and it can only do that if the
+# block loads first — a file naming certificate paths that do not exist yet fails
+# `nginx -t`, which is where an operator following these instructions would stop.
+write_nginx_conf() {
+  local domain="${LEERA_DOMAIN:-leera.example.com}"
+  local upstream="${LEERA_PROXY_BIND:-127.0.0.1:8080}"
+
+  cat > nginx-leera.conf <<EOF
+# Leera, behind the nginx you already run. Generated by install.sh.
+#
+# Everything goes to one upstream: the Caddy inside the Leera stack, which does the
+# path routing (/api, /storage, /_leera/update and the rest). That is on purpose —
+# those routes have sharp edges (the /storage prefix is part of an S3 signature, the
+# AI stream must not be buffered) and they change between releases. Leave the single
+# proxy_pass alone and this file never needs revisiting.
+
+# Named for this file so it cannot collide with a map you already have.
+map \$http_upgrade \$leera_connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name $domain;
+
+    # Caddy applies no request body limit, so neither does this: uploads go through
+    # /storage/* to object storage and can be large. Set a number here if you want
+    # one — it will apply to attachments.
+    client_max_body_size 0;
+
+    location / {
+        proxy_pass http://$upstream;
+        proxy_http_version 1.1;
+
+        proxy_set_header Host              \$host;
+        proxy_set_header X-Real-IP         \$remote_addr;
+        proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+
+        # WebSocket upgrades.
+        proxy_set_header Upgrade    \$http_upgrade;
+        proxy_set_header Connection \$leera_connection_upgrade;
+
+        # The AI response stream is server-sent events. Buffering it here would
+        # hold tokens back and deliver the reply in one lump at the end.
+        proxy_buffering off;
+        proxy_read_timeout 3600s;
+    }
+}
+EOF
+  say "wrote nginx-leera.conf for $domain"
 }
 
 # ── First-run setup wizard ───────────────────────────────────────────────────
@@ -743,9 +998,16 @@ run_wizard() {
   # same way Let's Encrypt will. If something else already holds it, fall back
   # to loopback rather than refusing to install.
   local on_port_80=1
-  if ! LEERA_INSTALL_TOKEN="$token" $COMPOSE -f compose.installer.yml -p leera-installer up -d >/dev/null 2>&1; then
+  # In external mode detect_external_proxy has already established that the
+  # operator's own proxy holds :80. Attempting the bind just to watch it fail would
+  # print a warning contradicting the answer they gave a moment ago.
+  if [ "${LEERA_PROXY_MODE:-bundled}" = "external" ]; then
+    on_port_80=0
+  elif ! LEERA_INSTALL_TOKEN="$token" $COMPOSE -f compose.installer.yml -p leera-installer up -d >/dev/null 2>&1; then
     on_port_80=0
     warn "port 80 is in use — setup will be reachable only on this machine, and the domain check is unavailable"
+  fi
+  if [ "$on_port_80" = "0" ]; then
     LEERA_INSTALL_TOKEN="$token" LEERA_INSTALLER_BIND=127.0.0.1:7777 \
       LEERA_DOMAIN_CHECK=unavailable \
       $COMPOSE -f compose.installer.yml -p leera-installer up -d >/dev/null 2>&1 \
@@ -805,6 +1067,10 @@ EOF
     printf '  │      http://localhost/?token=%s\n' "$token"
   else
     printf '  │      http://127.0.0.1:7777/?token=%s\n' "$token"
+    echo "  │"
+    echo "  │  Loopback only, because something else already has port 80. To"
+    echo "  │  open it from your own machine, tunnel in first:"
+    printf '  │      ssh -L 7777:127.0.0.1:7777 %s@<this-server>\n' "$(id -un)"
   fi
   cat <<EOF
   │                                                                     │
@@ -1575,6 +1841,10 @@ do_install() {
   if [ ! -f .env ]; then
     say "first install — generating secrets"
 
+    # Before the wizard, because the answer decides whether the wizard can have
+    # port 80 at all. Fresh installs only — see the note on the function.
+    detect_external_proxy
+
     # The browser wizard is the normal path: it asks where the database and
     # files should live and verifies both before anything starts. It is skipped
     # when the answers were supplied as environment variables, which is how
@@ -1663,6 +1933,14 @@ EOM
 # a full backup = database dump + the api container's /data volume + this file.
 LEERA_DOMAIN=$DOMAIN
 LEERA_PUBLIC_URL=$PUBLIC_URL
+
+# Who owns ports 80 and 443 on this machine.
+#   bundled  — the Caddy in this stack does, and obtains certificates itself.
+#   external — a reverse proxy you already run does. It terminates TLS and
+#              forwards everything to Caddy at LEERA_PROXY_BIND, which goes on
+#              routing each path to the right container. See nginx-leera.conf.
+LEERA_PROXY_MODE=${LEERA_PROXY_MODE:-bundled}
+LEERA_PROXY_BIND=${LEERA_PROXY_BIND:-127.0.0.1:8080}
 POSTGRES_PASSWORD=$(openssl rand -hex 24)
 MINIO_ROOT_USER=leera
 MINIO_ROOT_PASSWORD=$(openssl rand -hex 24)
@@ -1750,6 +2028,8 @@ EOF
   . ./.env
 
   derive_topology
+  check_mail_port
+  [ "${LEERA_PROXY_MODE:-bundled}" = "external" ] && write_nginx_conf
 
   # The image tags are floating (":selfhost"), moved to the newest release by
   # every publish — `up -d` alone only pulls an image that is missing outright,
@@ -1768,13 +2048,48 @@ EOF
     exit 1
   fi
 
-  cat <<EOF
+  # In external mode the stack is up but nothing outside can reach it yet: the
+  # operator's proxy has no idea we exist. Say what is left, in order, with their
+  # own domain already substituted — this is the difference between a mode people
+  # can adopt and one they abandon halfway.
+  if [ "${LEERA_PROXY_MODE:-bundled}" = "external" ]; then
+    cat <<EOF
+
+  ✅  Leera is running (version $(api_version)), listening on ${LEERA_PROXY_BIND:-127.0.0.1:8080}.
+
+  ⚠️   It is NOT reachable yet. Your own reverse proxy is in front, so three
+      things are left — all on your side, none of them ours to do for you:
+
+      1. Publish it through nginx:
+
+             sudo cp $INSTALL_DIR/nginx-leera.conf /etc/nginx/sites-available/leera
+             sudo ln -s /etc/nginx/sites-available/leera /etc/nginx/sites-enabled/leera
+             sudo nginx -t && sudo systemctl reload nginx
+
+      2. Get a certificate. Unlike the bundled Caddy, nginx does not obtain one
+         for you, so use the certbot you already have. It edits the block from
+         step 1 in place to add TLS and the redirect:
+
+             sudo certbot --nginx -d ${LEERA_DOMAIN:-your-domain}
+
+      3. Open ${LEERA_PUBLIC_URL} and finish setup (first account becomes admin).
+
+      Inbound project email is not supported in this mode — nothing here can get
+      a certificate for an MX hostname. Run Leera on its own instance if you
+      need it.
+EOF
+  else
+    cat <<EOF
 
   ✅  Leera is running (version $(api_version)).
 
       Open now and finish setup (the first account becomes the admin):
 
           ${LEERA_PUBLIC_URL}
+EOF
+  fi
+
+  cat <<EOF
 
   ┌─────────────────────────────────────────────────────────────────────┐
   │  BACKUPS — read this once, thank yourself later                     │
@@ -1800,7 +2115,7 @@ EOF
 }
 
 usage() {
-  sed -n '3,27p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//'
+  sed -n '3,33p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//'
 }
 
 # ── Dispatch ─────────────────────────────────────────────────────────────────

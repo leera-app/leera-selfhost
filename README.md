@@ -162,6 +162,58 @@ open the URL it prints — **the first account created becomes the administrator
 Everything lives in `~/leera` (override with `LEERA_HOME`): the generated
 `.env` holding your secrets, plus the compose file and Caddyfile.
 
+## If this server already runs nginx (or another reverse proxy)
+
+Leera normally puts its own Caddy on ports 80 and 443 and gets certificates for
+you. If those ports already belong to something else — nginx serving your other
+sites, Traefik, HAProxy, a load balancer — the installer notices, asks, and sets
+`LEERA_PROXY_MODE=external` in `~/leera/.env`.
+
+In that mode Caddy moves to `127.0.0.1:8080` and keeps doing what it is actually
+good at: routing each path to the right container. Your proxy terminates TLS and
+forwards everything to that one address. **Do not try to recreate Leera's routes
+in your own config** — `/storage/*` must keep its prefix (it is part of an S3
+signature), the AI stream must not be buffered, and the routes change between
+releases. One `proxy_pass` and you never touch it again.
+
+Set it up front for an unattended install:
+
+```bash
+LEERA_PROXY_MODE=external LEERA_DOMAIN=pm.example.com bash -c "$(curl -fsSL https://raw.githubusercontent.com/leera-app/leera-selfhost/main/install.sh)"
+```
+
+The install writes `~/leera/nginx-leera.conf` with your domain and port already
+filled in. Two steps are left, both on your side:
+
+```bash
+sudo cp ~/leera/nginx-leera.conf /etc/nginx/sites-available/leera
+sudo ln -s /etc/nginx/sites-available/leera /etc/nginx/sites-enabled/leera
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+Then get a certificate. **nginx does not obtain one for you the way Caddy does**,
+so use certbot — it rewrites the block above in place to add TLS and the
+redirect, which is why that file ships as plain HTTP:
+
+```bash
+sudo certbot --nginx -d pm.example.com
+```
+
+Two things to know:
+
+- **Setup runs on loopback.** With port 80 taken, the setup wizard binds
+  `127.0.0.1:7777`, so tunnel in to reach it: `ssh -L 7777:127.0.0.1:7777 you@server`.
+  The installer prints the exact command.
+- **If your proxy runs in a container**, a host loopback port is unreachable from
+  it. Set `LEERA_PROXY_BIND=0.0.0.0:8080` in `~/leera/.env` (and firewall the
+  port), or attach your proxy to this project's Docker network.
+
+Inbound project email is **not** supported in this mode: nothing here can obtain
+a certificate for an MX hostname, so mail would arrive unencrypted and large
+providers would penalise your domain for it. If you need inbound email, run
+Leera on its own instance with the bundled proxy — which is better practice
+anyway, since a mail host wants its own IP reputation and an uncontested port 25.
+
 ## Back up before you have data worth losing
 
 ```bash

@@ -50,15 +50,25 @@ services:
     logging: *logging
     restart: unless-stopped
     ports:
-      - "80:80"
-      - "443:443"
+      # The whole mapping, not just a bind address, because LEERA_PROXY_MODE=external
+      # moves Caddy behind someone else's reverse proxy on a loopback port. It has to
+      # be the whole string: `0.0.0.0:80:80` is NOT the same as `80:80` — the explicit
+      # form pins IPv4 only, while the bare one also binds IPv6 when the daemon has it
+      # enabled. Composing this out of a separate bind variable would have dropped IPv6
+      # on every existing install the first time derive_topology rewrote these keys.
+      - "${LEERA_HTTP_PORTS:-80:80}"
+      - "${LEERA_HTTPS_PORTS:-443:443}"
     environment:
       # Caddy's `{$VAR:default}` only falls back when the variable is UNSET, not
       # when it is set-but-empty. install.sh always writes LEERA_DOMAIN= for a
       # no-domain install, so the default must be applied here instead —
       # otherwise the site address expands to nothing, Caddy reads the leading
       # `{` as the global options block, and refuses to start.
-      LEERA_DOMAIN: ${LEERA_DOMAIN:-:80}
+      #
+      # LEERA_CADDY_SITE is derived by install.sh: the domain in bundled mode, a bare
+      # `:80` in external mode. That is what stops Caddy attempting ACME when someone
+      # else's proxy holds the ports it would need to answer the challenge on.
+      LEERA_DOMAIN: ${LEERA_CADDY_SITE:-${LEERA_DOMAIN:-:80}}
       # Hostname the MX records point at. Caddy obtains its certificate so the
       # mx container can serve STARTTLS; see the trailing site block in the
       # Caddyfile. The placeholder is a name that never resolves, so an install
