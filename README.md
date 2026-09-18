@@ -181,6 +181,7 @@ Set it up front for an unattended install:
 ```bash
 LEERA_PROXY_MODE=external LEERA_DOMAIN=pm.example.com bash -c "$(curl -fsSL https://raw.githubusercontent.com/leera-app/leera-selfhost/main/install.sh)"
 ```
+Replace the pm.example.com with real domain
 
 The install writes `~/leera/nginx-leera.conf` with your domain and port already
 filled in. Two steps are left, both on your side:
