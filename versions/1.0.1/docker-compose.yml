@@ -1,0 +1,421 @@
+# Leera self-hosted stack.
+#
+# Do not edit by hand for a normal install — run install.sh, which generates
+# the .env this file reads. Only the reverse proxy (caddy) publishes ports;
+# the API, database and object store are reachable solely on the internal
+# network, so forwarded headers and webhooks can only arrive through Caddy.
+
+# Database connection, shared by the API and the one-shot migrator so the two
+# can never drift. Defaults reproduce the bundled Postgres, so an install that
+# predates external-database support keeps working with an unchanged .env.
+#
+# PG_SSL defaults to disable because the default target is the `db` container
+# on this host's bridge network, which speaks no TLS. Point LEERA_PG_HOST at an
+# external server and install.sh clears this so TLS is verified.
+x-pg-env: &pg-env
+  PG.HOST: ${LEERA_PG_HOST:-db}
+  PG.PORT: ${LEERA_PG_PORT:-5432}
+  PG.USER: ${LEERA_PG_USER:-postgres}
+  PG.PASSWORD: ${LEERA_PG_PASSWORD:-${POSTGRES_PASSWORD}}
+  PG.DBNAME: ${LEERA_PG_DBNAME:-leera}
+  # Single-dash, so a present-but-empty LEERA_PG_SSL means "TLS on" rather than
+  # collapsing back to the bundled default. `:-` here would silently connect an
+  # external database in plaintext.
+  PG_SSL: ${LEERA_PG_SSL-disable}
+  # Extra CA bundle for a private-CA Postgres; empty means "system + AWS RDS".
+  PG_CA_FILE: ${LEERA_PG_CA_FILE-}
+
+# Container logs. Docker's default json-file driver has NO size limit, which on
+# a self-hosted box means the API's request log grows until the disk is full —
+# the single most common way one of these installs dies. Every service gets the
+# same cap: three 10 MB files, so the whole stack can never hold more than
+# ~30 MB of logs per container no matter how long it runs.
+#
+# Applied per-service rather than in /etc/docker/daemon.json because this file
+# is the thing we ship; a daemon setting would have to be installed on a host we
+# do not own, and would silently not exist on the next deployment target.
+#
+# Changing this only affects containers created afterwards — `docker compose up
+# -d --force-recreate` to apply it to a running stack.
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    container_name: leera-selfhost-caddy
+    logging: *logging
+    restart: unless-stopped
+    ports:
+      # The whole mapping, not just a bind address, because LEERA_PROXY_MODE=external
+      # moves Caddy behind someone else's reverse proxy on a loopback port. It has to
+      # be the whole string: `0.0.0.0:80:80` is NOT the same as `80:80` — the explicit
+      # form pins IPv4 only, while the bare one also binds IPv6 when the daemon has it
+      # enabled. Composing this out of a separate bind variable would have dropped IPv6
+      # on every existing install the first time derive_topology rewrote these keys.
+      - "${LEERA_HTTP_PORTS:-80:80}"
+      - "${LEERA_HTTPS_PORTS:-443:443}"
+    environment:
+      # Caddy's `{$VAR:default}` only falls back when the variable is UNSET, not
+      # when it is set-but-empty. install.sh always writes LEERA_DOMAIN= for a
+      # no-domain install, so the default must be applied here instead —
+      # otherwise the site address expands to nothing, Caddy reads the leading
+      # `{` as the global options block, and refuses to start.
+      #
+      # LEERA_CADDY_SITE is derived by install.sh: the domain in bundled mode, a bare
+      # `:80` in external mode. That is what stops Caddy attempting ACME when someone
+      # else's proxy holds the ports it would need to answer the challenge on.
+      LEERA_DOMAIN: ${LEERA_CADDY_SITE:-${LEERA_DOMAIN:-:80}}
+      # Hostname the MX records point at. Caddy obtains its certificate so the
+      # mx container can serve STARTTLS; see the trailing site block in the
+      # Caddyfile. The placeholder is a name that never resolves, so an install
+      # without inbound mail gets a site Caddy simply never issues a cert for.
+      LEERA_MX_HOSTNAME: ${LEERA_MX_HOSTNAME:-localhost.invalid}
+    volumes:
+      # Caddyfile.no-storage drops the /storage route for external object
+      # stores. It has to be a separate file rather than a conditional block:
+      # Caddy resolves upstreams lazily, so a route pointing at an absent
+      # `minio` would return 502s instead of falling through to the web app.
+      - ${LEERA_HOST_INSTALL_DIR:-.}/${LEERA_CADDYFILE:-Caddyfile}:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+      # The update progress page, written by the updater. Read-only, and served
+      # as static files: Caddy is not recreated during an update, so this is
+      # what the operator's browser is still talking to while api and web are
+      # being replaced. Empty (and harmless) when the updater is switched off.
+      - update_state:/srv/update:ro
+    depends_on:
+      - web
+      - api
+
+  web:
+    image: ${LEERA_IMAGE_REPO:-ghcr.io/leera-app}/leera-web:${LEERA_VERSION:-selfhost}
+    container_name: leera-selfhost-web
+    logging: *logging
+    restart: unless-stopped
+    environment:
+      # SSR / Server Actions reach the API over the internal network.
+      SERVER_URL_INTERNAL: http://api:8081
+      # Server-rendering faults. The same switch as the API's, because an
+      # operator turning reporting off means the whole install, not one
+      # container — and the browser half follows the API's answer already.
+      LEERA_ERROR_REPORTING: ${LEERA_ERROR_REPORTING-on}
+      ENVIRONMENT: production
+    depends_on:
+      - api
+
+  api:
+    image: ${LEERA_IMAGE_REPO:-ghcr.io/leera-app}/leera-api:${LEERA_VERSION:-selfhost}
+    container_name: leera-selfhost-api
+    logging: *logging
+    restart: unless-stopped
+    environment:
+      <<: *pg-env
+      # One image serves both editions and already defaults to self_hosted, so
+      # this is redundant — deliberately. It is stated here because an operator
+      # reading their own compose file should be able to see which product they
+      # are running without knowing what the image defaults to.
+      LEERA_EDITION: self_hosted
+      SERVER_ADDR: 0.0.0.0:8081
+      ENVIRONMENT: production
+      # SECRET_KEY is auto-generated on first boot into /data/secret_key.
+      # Back that file up together with the database.
+      SECRET_KEY_FILE: /data/secret_key
+      # Object storage. Defaults are the bundled MinIO, reached over the
+      # internal network and served back to browsers as /storage/... by Caddy.
+      #
+      # The single-dash `-` forms below are load-bearing and must not become
+      # `:-`. For AWS, install.sh writes these keys as present-but-EMPTY, which
+      # is the only way to say "no custom endpoint": an absent
+      # S3_PUBLIC_ENDPOINT makes the API fall back to this instance's own
+      # origin and sign path-style URLs against it, which AWS never honours.
+      # `:-` would substitute the default for an empty value and reintroduce
+      # exactly that bug.
+      S3_ENDPOINT: ${LEERA_S3_ENDPOINT-http://minio:9000}
+      S3_PUBLIC_ENDPOINT: ${LEERA_S3_PUBLIC_ENDPOINT-${LEERA_PUBLIC_URL:-http://localhost}}
+      S3_FORCE_PATH_STYLE: ${LEERA_S3_PATH_STYLE-}
+      AWS_BUCKET: ${LEERA_S3_BUCKET:-storage}
+      AWS_REGION: ${LEERA_S3_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID: ${LEERA_S3_ACCESS_KEY:-${MINIO_ROOT_USER}}
+      AWS_SECRET_ACCESS_KEY: ${LEERA_S3_SECRET_KEY:-${MINIO_ROOT_PASSWORD}}
+      # On an external store the API copies this configuration into
+      # instance_settings on first boot, so the admin UI shows the real values
+      # instead of claiming the instance is on the bundled MinIO. Left as
+      # 'bundled' the seeding is skipped, and install.sh keeps owning the
+      # MinIO credentials it generates.
+      LEERA_STORAGE_MODE: ${LEERA_STORAGE_MODE:-bundled}
+      # Links inside notification emails (replaced by instance settings later).
+      APP_BASE_URL: ${LEERA_PUBLIC_URL:-http://localhost}
+      # Shapes what the Updates page says when it cannot install an update
+      # itself: the fallback instructions have to match how this was deployed.
+      LEERA_DEPLOY_KIND: compose
+      # The runner image named in the copy-paste command the Test runners page
+      # shows, so a mirrored registry is the one people are told to pull from.
+      QA_RUNNER_IMAGE: ${LEERA_IMAGE_REPO:-ghcr.io/leera-app}/leera-qa-runner
+      # Crash reports. On unless the operator says otherwise; the License page
+      # in the admin UI enumerates exactly what one contains. `-` not `:-`, so
+      # an explicitly empty value still reaches the container as empty.
+      LEERA_ERROR_REPORTING: ${LEERA_ERROR_REPORTING-on}
+      RUST_LOG: info
+    volumes:
+      - leera_data:/data
+      # Private-CA bundle for an external Postgres, when the operator supplies
+      # one. Absent on a default install; `:ro` and never written to.
+      - ${LEERA_HOST_INSTALL_DIR:-.}/secrets:/secrets:ro
+      # The bundled object store and database volumes, read-only and never
+      # opened: the API only asks the kernel how full their disk is, for the
+      # low-space warning on Instance settings → Storage. With the bundled
+      # service switched off the volume stays empty and is ignored.
+      - minio_data:/var/lib/leera/object-store:ro
+      - pgdata:/var/lib/leera/database:ro
+    # `required: false` is what lets the bundled services be switched off by
+    # profile: without it Compose rejects the whole project with "api depends
+    # on undefined service db" whenever the profile is inactive.
+    depends_on:
+      db:
+        condition: service_healthy
+        required: false
+      minio:
+        condition: service_healthy
+        required: false
+      # The bucket must exist before the first upload. Previously nothing
+      # depended on this one-shot, so it raced the API's first request.
+      minio-init:
+        condition: service_completed_successfully
+        required: false
+      migrate:
+        condition: service_completed_successfully
+
+  # The built-in MX: inbound project email without a third-party parser.
+  #
+  # Same image as the API, different entrypoint — the pattern `migrate` uses, so
+  # there is no second image to build, pull, or version.
+  #
+  # Selected by profile (LEERA_INBOUND_MX=on → COMPOSE_PROFILES includes `mx`),
+  # because publishing a port is an install-time decision the admin UI cannot
+  # make on its own. The `inbound_email.mode` setting is the other half of the
+  # switch: with the profile on and the mode off, this process binds nothing.
+  #
+  # Why its own container rather than a thread in `api`: `build_pool` sets no
+  # max_size, so the API's pool is deadpool's default (num_cpus * 4, ~16 on a
+  # small box) shared with every HTTP handler. Every RCPT TO is a database
+  # lookup, so an SMTP flood run in-process would queue on those connections and
+  # hang the web app *behind* the admission limits. This process takes its own
+  # pool of 8.
+  mx:
+    profiles: ["mx"]
+    image: ${LEERA_IMAGE_REPO:-ghcr.io/leera-app}/leera-api:${LEERA_VERSION:-selfhost}
+    container_name: leera-selfhost-mx
+    logging: *logging
+    command: ["/usr/local/bin/leera-mx"]
+    restart: unless-stopped
+    ports:
+      # Host 25 → container 2525. The container listens unprivileged, so nothing
+      # here needs root or CAP_NET_BIND_SERVICE.
+      #
+      # This is the only port besides Caddy's that the stack publishes. The API
+      # is still unreachable from outside, so P1's trusted-proxy property holds:
+      # forwarded headers can only arrive through Caddy.
+      - "25:2525"
+    environment:
+      <<: *pg-env
+      MX_BIND: 0.0.0.0:2525
+      ENVIRONMENT: production
+      # Same switch as the API. This process fails in its own ways — a TLS
+      # handshake, a spool write — and none of them are visible from the API.
+      LEERA_ERROR_REPORTING: ${LEERA_ERROR_REPORTING-on}
+      SECRET_KEY_FILE: /data/secret_key
+      # Object storage: raw messages are spooled here before the SMTP session
+      # returns 250, and the API worker reads them back to build tickets.
+      S3_ENDPOINT: ${LEERA_S3_ENDPOINT-http://minio:9000}
+      S3_PUBLIC_ENDPOINT: ${LEERA_S3_PUBLIC_ENDPOINT-${LEERA_PUBLIC_URL:-http://localhost}}
+      S3_FORCE_PATH_STYLE: ${LEERA_S3_PATH_STYLE-}
+      AWS_BUCKET: ${LEERA_S3_BUCKET:-storage}
+      AWS_REGION: ${LEERA_S3_REGION:-us-east-1}
+      AWS_ACCESS_KEY_ID: ${LEERA_S3_ACCESS_KEY:-${MINIO_ROOT_USER}}
+      AWS_SECRET_ACCESS_KEY: ${LEERA_S3_SECRET_KEY:-${MINIO_ROOT_PASSWORD}}
+      RUST_LOG: info
+    volumes:
+      - leera_data:/data
+      - ${LEERA_HOST_INSTALL_DIR:-.}/secrets:/secrets:ro
+      # Caddy's certificate store, read-only, so STARTTLS uses the instance's
+      # real certificate instead of a self-signed one. Requires the MX hostname
+      # to be in the Caddy site list — install.sh adds it.
+      - caddy_data:/caddy-data:ro
+    depends_on:
+      db:
+        condition: service_healthy
+        required: false
+      migrate:
+        condition: service_completed_successfully
+
+  # Browser test runner: replays automated QA test cases in headless Chromium and
+  # reports results to the API. Selected by profile (`qa-runner`) because each
+  # browser needs 500 MB or more of memory. Its only credential is a runner pool
+  # token; it has no database or storage access.
+  qa-runner:
+    profiles: ["qa-runner"]
+    image: ${LEERA_IMAGE_REPO:-ghcr.io/leera-app}/leera-qa-runner:${LEERA_VERSION:-selfhost}
+    container_name: leera-selfhost-qa-runner
+    logging: *logging
+    restart: unless-stopped
+    init: true
+    # Chromium renders through /dev/shm; Docker's 64 MB default crashes pages.
+    shm_size: 1gb
+    # Lets tests reach a site served on the Docker host as host.docker.internal,
+    # which Docker Desktop defines but Linux does not.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      LEERA_URL: http://api:8081
+      LEERA_RUNNER_TOKEN: ${LEERA_QA_RUNNER_TOKEN:-}
+      RUNNER_NAME: ${LEERA_QA_RUNNER_NAME:-selfhost}
+    depends_on:
+      api:
+        condition: service_started
+
+  # One-shot schema migrator. Shares the API image; never runs as part of the
+  # long-lived API process. Reruns safely on every upgrade.
+  migrate:
+    image: ${LEERA_IMAGE_REPO:-ghcr.io/leera-app}/leera-api:${LEERA_VERSION:-selfhost}
+    container_name: leera-selfhost-migrate
+    logging: *logging
+    command: ["/usr/local/bin/migrate"]
+    environment:
+      <<: *pg-env
+      ENVIRONMENT: production
+      MIGRATE_CONFIRM_PROD: "yes"
+    volumes:
+      - ${LEERA_HOST_INSTALL_DIR:-.}/secrets:/secrets:ro
+    depends_on:
+      db:
+        condition: service_healthy
+        required: false
+    restart: "no"
+
+  # The update service: what makes "Update now" in the admin UI possible.
+  #
+  # Omitted by profile when LEERA_UPDATER=off, because of what it needs to
+  # exist at all — the Docker socket, which is root on this host. Read
+  # deploy/selfhost/updater/README.md before deciding; the short version:
+  #
+  #   - It listens on nothing at all. The API writes a request file into the
+  #     shared volume and this container reads it; progress goes out as a file
+  #     that Caddy serves read-only. A container holding the Docker socket
+  #     should not also own a socket anything can connect to.
+  #   - It never runs anything but ./install.sh from the install directory —
+  #     the same script an operator runs over SSH, so the two upgrade paths
+  #     cannot drift.
+  #   - The image is a pinned Docker CLI plus a shell script; the script lives
+  #     in the install directory and is re-exec'd after every update, so this
+  #     image itself almost never needs replacing.
+  updater:
+    profiles: ["updater"]
+    image: ${LEERA_IMAGE_REPO:-ghcr.io/leera-app}/leera-updater:${LEERA_UPDATER_VERSION:-selfhost}
+    container_name: leera-selfhost-updater
+    logging: *logging
+    restart: unless-stopped
+    environment:
+      LEERA_INSTALL_DIR: /install
+      LEERA_UPDATE_DIR: /data/update
+      LEERA_PUBLIC_URL: ${LEERA_PUBLIC_URL:-http://localhost}
+      # Bind mounts requested from inside this container are resolved by the
+      # daemon against the *host* filesystem, not against this container's.
+      # install.sh uses this to translate its own paths before handing them to
+      # `docker run -v`, and every relative mount in this file is written
+      # against it for the same reason.
+      #
+      # NOT ${PWD}: when compose runs inside this container the working
+      # directory is /install, so re-deriving it here would hand the recreated
+      # updater a path that does not exist on the host and break the *next*
+      # update. install.sh pins the real value in .env (pin_host_install_dir);
+      # the ${PWD} fallback only covers a first `up` that somehow precedes it.
+      LEERA_HOST_INSTALL_DIR: ${LEERA_HOST_INSTALL_DIR:-${PWD}}
+    volumes:
+      # Root on this host. Everything above is why that is acceptable.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # The install directory: docker-compose.yml, .env, and install.sh, which
+      # is the only program this container ever runs.
+      - ${LEERA_HOST_INSTALL_DIR:-.}/:/install
+      # Shared with the api container: the request file it writes, and the
+      # result file it reads back. Deliberately NOT the directory Caddy
+      # serves — /data also holds secret_key.
+      - leera_data:/data
+      # What Caddy publishes at /_leera/update/: the progress page and one
+      # JSON state document per update. Write-only from here, read-only there.
+      - update_state:/srv/update
+
+  # Bundled Postgres. Omitted entirely when the operator brings their own —
+  # see COMPOSE_PROFILES in .env, which install.sh derives from LEERA_DB_MODE.
+  db:
+    profiles: ["db-bundled"]
+    image: postgres:17-alpine
+    container_name: leera-selfhost-db
+    logging: *logging
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: leera
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d leera"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+
+  # Bundled object store. Omitted when the operator points at real S3.
+  minio:
+    profiles: ["s3-bundled"]
+    # MinIO's own registry: MinIO withdrew its images from Docker Hub in
+    # September 2026. Pinned to the build Docker Hub's `latest` was at the
+    # time, which is the one every install from then has, so nothing on
+    # disk changes. Keep in step with MC_IMAGE in install.sh.
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    container_name: leera-selfhost-minio
+    logging: *logging
+    restart: unless-stopped
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # One-shot: create the `storage` bucket on first boot. External S3 buckets
+  # are created by the installer instead, using the API's own SigV4 client.
+  minio-init:
+    profiles: ["s3-bundled"]
+    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+    container_name: leera-selfhost-minio-init
+    logging: *logging
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD &&
+      mc mb --ignore-existing local/storage
+      "
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    depends_on:
+      minio:
+        condition: service_healthy
+    restart: "no"
+
+volumes:
+  pgdata:
+  minio_data:
+  leera_data:
+  caddy_data:
+  caddy_config:
+  update_state:
