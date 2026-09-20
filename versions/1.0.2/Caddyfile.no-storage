@@ -1,0 +1,87 @@
+# Leera self-hosted reverse proxy — external object storage.
+#
+# Identical to Caddyfile minus the /storage route: with an external S3 bucket
+# there is no MinIO to proxy to, and browsers fetch objects directly from the
+# store using presigned URLs signed against its own hostname.
+#
+# Selected by LEERA_CADDYFILE in .env, which install.sh derives from
+# LEERA_STORAGE_MODE. Keep in sync with Caddyfile for the two shared routes.
+#
+#   /api/*           -> Rust API   (WebSocket upgrades pass through; SSE unbuffered)
+#   /ai/sse          -> Rust API   (AI stream; exact path — /ai/* is web pages)
+#   /mcp*            -> Rust API   (MCP endpoint for AI clients)
+#   /_leera/update/* -> updater    (the one route that outlives an update)
+#   everything       -> Next.js web
+
+{$LEERA_DOMAIN::80} {
+	# Everything compressible except text/event-stream.
+	#
+	# Caddy's default match includes `text/*`, which swallows SSE: the AI
+	# stream came back gzipped, so it arrived buffered and browser clients
+	# failed on it. It worked in Postman only because Postman sends no
+	# Accept-Encoding. Listing the types explicitly keeps compression for the
+	# web app and leaves the event stream alone.
+	encode zstd gzip {
+		match {
+			header Content-Type text/html*
+			header Content-Type text/plain*
+			header Content-Type text/css*
+			header Content-Type text/javascript*
+			header Content-Type text/xml*
+			header Content-Type application/json*
+			header Content-Type application/javascript*
+			header Content-Type application/xhtml+xml*
+			header Content-Type application/xml*
+			header Content-Type image/svg+xml*
+			header Content-Type application/wasm*
+		}
+	}
+
+	# See Caddyfile: the update progress page, served by the one container
+	# that is still running while api and web are being replaced.
+	handle_path /_leera/update/* {
+		root * /srv/update
+		header Cache-Control "no-store"
+		file_server
+	}
+
+	# The AI streaming endpoint. It lives at the API root rather than under
+	# /api, and it cannot be folded into a /ai/* rule: /ai/{workspace}/chat
+	# and its siblings are Next.js pages. Exact match, so only this one path
+	# leaves the web app.
+	handle /ai/sse {
+		reverse_proxy api:8081 {
+			flush_interval -1
+		}
+	}
+
+	# The MCP endpoint, for AI clients (Claude, Cursor) connecting to this
+	# instance. Like /ai/sse it lives at the API root rather than under /api:
+	# MCP clients are given one URL to paste, and `https://<host>/mcp` is the
+	# conventional shape. Prefix rather than exact, so a client that appends a
+	# trailing slash still lands on the API instead of the web app's 404.
+	handle /mcp* {
+		reverse_proxy api:8081
+	}
+
+	# OAuth discovery for the MCP endpoint (`domain::oauth`). RFC 8414 and
+	# RFC 9728 fix these at the well-known root, so like /mcp they cannot live
+	# under /api. Prefix, so the path-qualified form Claude probes first
+	# (/.well-known/oauth-protected-resource/mcp) lands here too. Everything
+	# else OAuth is under /api/v1/oauth/ and already reaches the API below.
+	handle /.well-known/oauth-* {
+		reverse_proxy api:8081
+	}
+
+	handle /api/* {
+		# flush_interval -1 disables response buffering so AI SSE streams
+		# reach the browser token by token. WebSockets upgrade natively.
+		reverse_proxy api:8081 {
+			flush_interval -1
+		}
+	}
+
+	handle {
+		reverse_proxy web:5400
+	}
+}
