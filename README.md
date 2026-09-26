@@ -251,6 +251,13 @@ Takes a pre-upgrade backup, pulls new images, applies migrations, and restarts.
 Migrations are the one part a rollback will not undo, which is why the backup
 is automatic and not optional.
 
+**Updating to 1.0.5 from an earlier version** also moves your uploaded files
+from MinIO, which no longer publishes images, to the bundled SeaweedFS. The
+update copies and checks every file before it changes anything else, and needs
+free disk space of about the size of your files. If it cannot finish, it puts
+everything back. MinIO's old volume is kept until the next update, which removes
+it. See `docs/self-hosting/backup-and-upgrade.md` for the details.
+
 ## Check on it
 
 ```bash
@@ -289,7 +296,7 @@ and is not supported for self-hosting.
 | `api` | Rust API |
 | `migrate` | one-shot schema migrator, re-run on every upgrade |
 | `db` | PostgreSQL 17 |
-| `minio` | S3-compatible object storage for uploads |
+| `objects` | SeaweedFS, the S3-compatible object storage for uploads |
 
 A single public origin serves everything: `/api/*` to the API, `/storage/*` to
 object storage, and everything else to the web app.
