@@ -13,6 +13,7 @@
 #   everything       -> Next.js web
 
 {$LEERA_DOMAIN::80} {
+	# we should support other ports but that is not possible with current setup. 
 	# Everything compressible except text/event-stream.
 	#
 	# Caddy's default match includes `text/*`, which swallows SSE: the AI
