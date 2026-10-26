@@ -54,7 +54,7 @@ COMPOSE="docker compose"
 
 # The release this copy belongs to, written in when a release is published. A
 # copy from a checkout keeps the marker, which is not a version.
-BUNDLE_VERSION="${LEERA_BUNDLE_VERSION:-1.8.0}"
+BUNDLE_VERSION="${LEERA_BUNDLE_VERSION:-1.10.0}"
 
 # The bundled object store, and the one tool this script uses on it: bucket
 # setup, backups, restores and the move off MinIO. Pinned by digest as well as
@@ -776,6 +776,32 @@ backfill_modes() {
   if ! env_has LEERA_PROXY_BIND; then
     env_set LEERA_PROXY_BIND 127.0.0.1:8080
   fi
+  # Before LEERA_INBOUND_MX the built-in mail server had no switch: an operator
+  # turned it on by adding `mx` to COMPOSE_PROFILES by hand, and the next run of
+  # derive_topology rewrote that line without it. Carry their choice over, once,
+  # so the first update that has the switch does not take their mail away.
+  if ! env_has LEERA_INBOUND_MX; then
+    if mx_enabled_by_hand; then
+      env_set LEERA_INBOUND_MX on
+      say "the built-in mail server was switched on by hand — recorded as LEERA_INBOUND_MX=on"
+    else
+      env_set LEERA_INBOUND_MX off
+    fi
+  fi
+}
+
+# Did the operator run the built-in mail server before it had a switch?
+#
+# The hand-edited line is the obvious evidence, but often already gone: an update
+# runs the installer it is leaving before handing over to the new one, and that
+# older derive_topology rewrites COMPOSE_PROFILES first. The container outlives
+# it — compose stops managing a service whose profile is off, it does not stop
+# the service — so a running leera-selfhost-mx says the same thing.
+mx_enabled_by_hand() {
+  case ",$(env_get COMPOSE_PROFILES | tr -d " \"'")," in
+    *,mx,*) return 0 ;;
+  esac
+  [ "$(docker inspect -f '{{.State.Running}}' leera-selfhost-mx 2>/dev/null)" = "true" ]
 }
 
 # Translate a path in *this* filesystem to the equivalent on the Docker host.
@@ -793,17 +819,19 @@ host_path() {
   fi
 }
 
-# Translate the two modes into the COMPOSE_PROFILES and Caddyfile that compose
+# Translate the mode keys into the COMPOSE_PROFILES and Caddyfile that compose
 # reads. Always recomputed, so the modes are the single source of truth and the
-# two derived keys can never disagree with them.
+# derived keys can never disagree with them.
+#
+# Also sets STACK_PROFILES: the same list without `mx`, for the `up` that starts
+# everything else. start_mx brings the mail server up on its own afterwards.
 derive_topology() {
   local db_mode="${LEERA_DB_MODE:-bundled}"
   local storage_mode="${LEERA_STORAGE_MODE:-bundled}"
   local profiles="" caddyfile="Caddyfile"
-  # What .env said before this function overwrites it. The list built below is
-  # derived purely from the mode keys, so it can never contain `mx` — that profile
-  # only ever arrives by an operator editing COMPOSE_PROFILES by hand, and the
-  # warning at the end has to look at what they wrote, not at what we computed.
+  # What .env said before this function overwrites it, for the warning at the
+  # end: an operator who adds `mx` by hand after the switch exists is told why it
+  # disappeared rather than left to find out when mail stops.
   local prior_profiles="${COMPOSE_PROFILES:-}"
 
   case "$db_mode" in
@@ -838,7 +866,7 @@ derive_topology() {
   # Caddy moves to a loopback port behind it — still routing every path, just not
   # holding the front door. See the header of Caddyfile for why Caddy stays in the
   # picture at all rather than handing seven routes to somebody else's config.
-  local http_ports https_ports caddy_site
+  local http_ports https_ports caddy_site trusted_proxies
   case "${LEERA_PROXY_MODE:-bundled}" in
     bundled)
       # These two must reproduce what the compose file said before these keys
@@ -847,6 +875,8 @@ derive_topology() {
       http_ports="80:80"
       https_ports="443:443"
       caddy_site="${LEERA_DOMAIN:-:80}"
+      # Caddy faces callers itself: no peer may vouch for another's address.
+      trusted_proxies=""
       ;;
     external)
       http_ports="${LEERA_PROXY_BIND:-127.0.0.1:8080}:80"
@@ -858,8 +888,38 @@ derive_topology() {
       # it cannot answer a challenge on ports it no longer holds, and a named site
       # would have it retrying issuance forever.
       caddy_site=":80"
+      # The operator's proxy reaches Caddy from a private address (the Docker
+      # gateway for a host proxy, the proxy's own for one on this network).
+      # Trusting it keeps the caller's address in X-Forwarded-For.
+      trusted_proxies="private_ranges"
       ;;
     *) fail "LEERA_PROXY_MODE must be 'bundled' or 'external' (got '${LEERA_PROXY_MODE:-}')" ;;
+  esac
+
+  # The built-in mail server: the `mx` container, publishing port 25. Last in the
+  # list, and left out of STACK_PROFILES, so start_mx can start it separately.
+  STACK_PROFILES="$profiles"
+  case "${LEERA_INBOUND_MX:-off}" in
+    on)
+      # Inbound mail needs a certificate for the MX hostname, and in external mode
+      # nothing here issues one: Caddy is not doing ACME, so tls::acceptor finds no
+      # certificate, STARTTLS is never advertised, and mail is delivered in the
+      # clear — which is what gets a domain flagged by Google and Microsoft. A
+      # warning used to say so, on runs the updater makes where nobody reads it.
+      # Refused instead, here, before an install or update has changed anything.
+      if [ "${LEERA_PROXY_MODE:-bundled}" = "external" ]; then
+        fail "LEERA_INBOUND_MX=on does not work with LEERA_PROXY_MODE=external.
+        Your own reverse proxy holds ports 80 and 443, so nothing here can obtain a
+        certificate for the mail hostname, and mail would be accepted WITHOUT
+        encryption, which large providers penalise your domain for. Set
+        LEERA_INBOUND_MX=off in $INSTALL_DIR/.env and run this again (an inbound-parse
+        provider can still deliver project email: Instance Settings → Email), or run
+        Leera on its own instance with the bundled proxy."
+      fi
+      profiles="${profiles:+$profiles,}mx"
+      ;;
+    off) ;;
+    *) fail "LEERA_INBOUND_MX must be 'on' or 'off' (got '${LEERA_INBOUND_MX:-}')" ;;
   esac
 
   # `required: false` in docker-compose.yml is what lets the bundled services be
@@ -885,24 +945,33 @@ derive_topology() {
   env_set LEERA_HTTP_PORTS "$http_ports"
   env_set LEERA_HTTPS_PORTS "$https_ports"
   env_set LEERA_CADDY_SITE "$caddy_site"
+  env_set LEERA_TRUSTED_PROXIES "$trusted_proxies"
 
-  # Inbound mail needs a certificate for the MX hostname, and in external mode
-  # nothing here issues one: Caddy is not doing ACME, so tls::acceptor finds no
-  # certificate, STARTTLS is never advertised, and mail is delivered in the clear —
-  # which is what gets a domain flagged by Google and Microsoft. Silent is the one
-  # thing that must not happen, so say so on every install and upgrade.
-  case ",$prior_profiles," in
-    *,mx,*)
-      if [ "${LEERA_PROXY_MODE:-bundled}" = "external" ]; then
-        warn "inbound email is enabled but this install sits behind your own reverse proxy,
-        so nothing here can obtain a certificate for the MX hostname. Mail would be
-        accepted WITHOUT encryption, which large providers penalise. Inbound email is
-        supported on a bundled install — run it on its own instance if you need it."
-      fi
-      ;;
-  esac
+  if [ "${LEERA_INBOUND_MX:-off}" = "on" ]; then
+    # Caddy obtains the mail hostname's certificate only when it is named here;
+    # without it the site is the never-resolving placeholder in the Caddyfile.
+    # Mail still arrives, unencrypted, so this warns rather than refusing — the
+    # email domain is usually chosen in the app after the install.
+    if [ -z "${LEERA_MX_HOSTNAME:-}" ]; then
+      warn "the built-in mail server is on, but LEERA_MX_HOSTNAME is not set, so no
+        certificate is obtained for it and mail is accepted WITHOUT encryption. Set it
+        in $INSTALL_DIR/.env to the hostname your MX records point at (the Mail
+        hostname in Instance Settings → Email; mx.<email domain> unless you changed
+        it), then run this again."
+    fi
+  else
+    # COMPOSE_PROFILES is derived, so an `mx` added to it by hand is gone again
+    # by now. Say so, and name the key that does what they meant.
+    case ",$prior_profiles," in
+      *,mx,*)
+        warn "COMPOSE_PROFILES named the mx profile, but that line is rewritten from the
+        mode keys on every run and LEERA_INBOUND_MX is off, so the built-in mail server
+        stays off. Set LEERA_INBOUND_MX=on in $INSTALL_DIR/.env to run it."
+        ;;
+    esac
+  fi
 
-  say "topology: database=$db_mode storage=$storage_mode proxy=${LEERA_PROXY_MODE:-bundled} (profiles: ${profiles:-none})"
+  say "topology: database=$db_mode storage=$storage_mode proxy=${LEERA_PROXY_MODE:-bundled} mail=${LEERA_INBOUND_MX:-off} (profiles: ${profiles:-none})"
 }
 
 # Is something already listening on this TCP port?
@@ -1009,18 +1078,48 @@ detect_external_proxy() {
   fi
 }
 
-# Mail is optional, so this warns rather than failing. Fresh installs only, and only
-# when the operator asked for mx: on an upgrade the thing holding 25 is our own
-# container. Worth saying because Ubuntu images so often ship postfix already
-# listening, and the alternative is an opaque compose error much later.
+# Mail is optional, so this warns rather than failing. Installs only, and only when
+# LEERA_INBOUND_MX is on: on an upgrade, or a re-run of an install that already has
+# the mail server, the thing holding 25 is our own container. Worth saying before
+# anything starts because Ubuntu images so often ship postfix already listening.
 check_mail_port() {
-  case ",${COMPOSE_PROFILES:-}," in
-    *,mx,*) ;;
-    *) return 0 ;;
-  esac
+  [ "${LEERA_INBOUND_MX:-off}" = "on" ] || return 0
+  [ "$(docker inspect -f '{{.State.Running}}' leera-selfhost-mx 2>/dev/null)" = "true" ] && return 0
   if port_in_use 25; then
     warn "port 25 is already in use — Ubuntu images often ship postfix or exim running.
-        Inbound email will not start until that port is free."
+        Inbound email will not start until that port is free; everything else will."
+  fi
+  return 0
+}
+
+# Bring the built-in mail server in line with LEERA_INBOUND_MX, once the rest of
+# the stack is up and answering.
+#
+# On: (re)create it on the version now running. On its own, after the health
+# check, so that port 25 being taken — the one port an ordinary server is likely
+# to have given away already — costs inbound email and not the install, restore
+# or update it happens in. --no-deps because the API answering means the
+# database is up and migrations have run.
+#
+# Off: remove a container left from when it was on. With its profile gone compose
+# no longer knows the service, so neither `up` nor an update touches it, and it
+# would go on holding port 25 on whatever version it started with. By container
+# name, as do_qa_runner does.
+start_mx() {
+  local up_out
+  if [ "${LEERA_INBOUND_MX:-off}" = "on" ]; then
+    if ! up_out="$($COMPOSE up -d --no-deps mx 2>&1)"; then
+      warn "the built-in mail server did not start, so inbound email is not being received.
+        Everything else is running. Compose said: $(printf '%s' "$up_out" | grep -v '^ *$' | tail -n 3)
+        If port 25 is taken (postfix and exim are common), free it and run ./install.sh again."
+    fi
+    return 0
+  fi
+  docker inspect leera-selfhost-mx >/dev/null 2>&1 || return 0
+  if docker rm -f leera-selfhost-mx >/dev/null 2>&1; then
+    say "removed the built-in mail server (LEERA_INBOUND_MX=off)"
+  else
+    warn "could not remove the built-in mail server — remove it with: docker rm -f leera-selfhost-mx"
   fi
 }
 
@@ -1524,9 +1623,11 @@ do_restore() {
   fi
 
   say "restarting the stack"
-  $COMPOSE up -d
+  # Everything but the mail server, which start_mx brings up once the API answers.
+  COMPOSE_PROFILES="$STACK_PROFILES" $COMPOSE up -d
   reload_caddy
   if wait_for_api; then
+    start_mx
     say "restore complete — the API is answering (version $(api_version))"
     say "sign in to confirm: existing sessions survive when the secret key matches"
   else
@@ -2526,6 +2627,9 @@ do_upgrade() {
   if [ -n "$TARGET_VERSION" ] && [ -n "$after" ] && [ "$after" != "$TARGET_VERSION" ]; then
     warn "expected version $TARGET_VERSION but the API reports $after"
   fi
+  # Not part of the restart above: a mail server that cannot have port 25 must
+  # not roll back an update that has otherwise succeeded.
+  start_mx
   step_done health
 
   # Only now: up to this point rollback_to may still need the image we came
@@ -2768,6 +2872,16 @@ LEERA_UPDATER_VERSION=${LEERA_UPDATER_VERSION:-selfhost}
 # created by a workspace administrator; each browser uses 500 MB+ of memory.
 LEERA_QA_RUNNER=${LEERA_QA_RUNNER:-off}
 LEERA_QA_RUNNER_TOKEN=${LEERA_QA_RUNNER_TOKEN:-}
+
+# The built-in mail server, for inbound project email ("This server receives
+# mail directly" in Instance Settings → Email). 'on' publishes port 25; it needs
+# the bundled proxy (LEERA_PROXY_MODE=bundled), which is what obtains the mail
+# hostname's certificate. Set LEERA_MX_HOSTNAME to the hostname your MX records
+# point at — the Mail hostname on that settings page, mx.<email domain> unless
+# you changed it — or mail is accepted without encryption. Edit both here, then
+# run ./install.sh again; COMPOSE_PROFILES below is rewritten on every run.
+LEERA_INBOUND_MX=${LEERA_INBOUND_MX:-off}
+LEERA_MX_HOSTNAME=${LEERA_MX_HOSTNAME:-}
 EOF
 
     if [ "${LEERA_DB_MODE:-bundled}" = "external" ]; then
@@ -2837,7 +2951,8 @@ EOF
   # this machine pulled it.
   say "starting the stack (first run downloads images and can take a few minutes)"
   $COMPOSE pull || warn "could not pull — continuing with the images already on this machine"
-  $COMPOSE up -d
+  # Everything but the mail server, which start_mx brings up once the API answers.
+  COMPOSE_PROFILES="$STACK_PROFILES" $COMPOSE up -d
   reload_caddy
 
   if ! wait_for_api; then
@@ -2845,6 +2960,7 @@ EOF
     say "    cd $INSTALL_DIR && $COMPOSE logs api migrate"
     exit 1
   fi
+  start_mx
 
   # In external mode the stack is up but nothing outside can reach it yet: the
   # operator's proxy has no idea we exist. Say what is left, in order, with their
@@ -2872,9 +2988,10 @@ EOF
 
       3. Open ${LEERA_PUBLIC_URL} and finish setup (first account becomes admin).
 
-      Inbound project email is not supported in this mode — nothing here can get
-      a certificate for an MX hostname. Run Leera on its own instance if you
-      need it.
+      The built-in mail server (LEERA_INBOUND_MX) is not available in this
+      mode — nothing here can get a certificate for an MX hostname. An
+      inbound-parse provider can still deliver project email (Instance
+      Settings → Email), or run Leera on its own instance with the bundled proxy.
 EOF
   else
     cat <<EOF
@@ -2962,7 +3079,7 @@ do_qa_runner() {
 }
 
 usage() {
-  sed -n '3,34p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//'
+  sed -n '3,32p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//'
 }
 
 # ── Dispatch ─────────────────────────────────────────────────────────────────

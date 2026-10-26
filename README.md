@@ -13,7 +13,9 @@ API, PostgreSQL, object storage, and a reverse proxy with automatic HTTPS.
   prerequisite** — the installer installs Docker Engine and the Compose plugin
   itself if they are missing, after asking.
 - Ports **80** and **443** free — the proxy is the only thing that binds
-  publicly; the API, database and object store stay on an internal network
+  publicly; the API, database and object store stay on an internal network.
+  Port **25** too, only if you turn on the
+  [built-in mail server](#receive-project-email-on-this-server)
 - For HTTPS: a domain with a DNS **A record already pointing at this server**.
   Certificates are issued on first start, and that fails if DNS is not live yet.
 - **25 GB of disk**, and 2 GB of RAM. The stack itself is about 1 GB of images
@@ -208,11 +210,55 @@ Two things to know:
   it. Set `LEERA_PROXY_BIND=0.0.0.0:8080` in `~/leera/.env` (and firewall the
   port), or attach your proxy to this project's Docker network.
 
-Inbound project email is **not** supported in this mode: nothing here can obtain
-a certificate for an MX hostname, so mail would arrive unencrypted and large
-providers would penalise your domain for it. If you need inbound email, run
-Leera on its own instance with the bundled proxy — which is better practice
-anyway, since a mail host wants its own IP reputation and an uncontested port 25.
+The [built-in mail server](#receive-project-email-on-this-server) is **not**
+supported in this mode, and the installer refuses `LEERA_INBOUND_MX=on` with it:
+nothing here can obtain a certificate for an MX hostname, so mail would arrive
+unencrypted and large providers would penalise your domain for it. If you need
+it, run Leera on its own instance with the bundled proxy — which is better
+practice anyway, since a mail host wants its own IP reputation and an
+uncontested port 25.
+
+## Receive project email on this server
+
+Project email addresses turn incoming mail into tickets. Leera can receive that
+mail itself, with a built-in mail server on port 25, so no third-party mail
+service is involved. It is off by default. To turn it on:
+
+1. Pick the hostname your MX records will point at, e.g. `mx.example.com`, and
+   point an **A record** for it at this server first — its certificate is
+   requested in the next step.
+2. Set these in `~/leera/.env` and run the installer again:
+
+   ```bash
+   LEERA_INBOUND_MX=on
+   LEERA_MX_HOSTNAME=mx.example.com
+   ```
+
+   ```bash
+   cd ~/leera && ./install.sh
+   ```
+
+3. Open port **25** in your firewall. Many hosting providers block inbound
+   port 25 by default.
+4. In the app, open **Instance Settings → Email → Inbound project email**,
+   choose **This server receives mail directly**, set the email domain and the
+   same mail hostname, save, and create the DNS records the page lists.
+
+`LEERA_MX_HOSTNAME` is what gets the mail hostname a certificate, so mail
+arrives encrypted (STARTTLS); the installer warns until it is set. Updates keep
+the mail server on and move it to the new version. If port 25 is already taken,
+by postfix for example, the rest of Leera still starts and the installer says
+that inbound email is not running. `LEERA_INBOUND_MX=off` and another
+`./install.sh` turn it off and free the port.
+
+Do not add `mx` to `COMPOSE_PROFILES` by hand: the installer rewrites that line
+on every run. An install that did so before `LEERA_INBOUND_MX` existed is
+carried over as `LEERA_INBOUND_MX=on` the first time a newer installer runs.
+
+If your host blocks port 25, or Leera sits behind your own reverse proxy, choose
+**An inbound-parse provider forwards to us** on the same settings page instead
+and leave `LEERA_INBOUND_MX` off; the page shows the webhook address to give the
+provider.
 
 ## Back up before you have data worth losing
 
@@ -291,12 +337,13 @@ and is not supported for self-hosting.
 
 | service | role |
 | --- | --- |
-| `caddy` | reverse proxy, automatic HTTPS, the only service with published ports |
+| `caddy` | reverse proxy, automatic HTTPS, the only service with published ports besides `mx` |
 | `web` | Next.js application |
 | `api` | Rust API |
 | `migrate` | one-shot schema migrator, re-run on every upgrade |
 | `db` | PostgreSQL 17 |
 | `objects` | SeaweedFS, the S3-compatible object storage for uploads |
+| `mx` | the built-in mail server on port 25, only with `LEERA_INBOUND_MX=on` |
 
 A single public origin serves everything: `/api/*` to the API, `/storage/*` to
 object storage, and everything else to the web app.
