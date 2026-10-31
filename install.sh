@@ -54,7 +54,7 @@ COMPOSE="docker compose"
 
 # The release this copy belongs to, written in when a release is published. A
 # copy from a checkout keeps the marker, which is not a version.
-BUNDLE_VERSION="${LEERA_BUNDLE_VERSION:-1.10.0}"
+BUNDLE_VERSION="${LEERA_BUNDLE_VERSION:-1.11.0}"
 
 # The bundled object store, and the one tool this script uses on it: bucket
 # setup, backups, restores and the move off MinIO. Pinned by digest as well as
