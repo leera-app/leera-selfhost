@@ -33,6 +33,10 @@
 # of it. Set LEERA_PROXY_MODE up front to answer ahead of time. An install in
 # that mode writes nginx-leera.conf here, ready to drop into nginx.
 #
+# A fresh install asks for an email first, for the licence key and for help if
+# the install fails. Leaving it blank skips it; LEERA_EMAIL answers it ahead of
+# time. Given one, the installer tells us when it starts, fails or finishes.
+#
 # A "complete" backup is three things — database dump, secret key, and .env.
 # Any one of them missing makes the other two useless, which is why backup and
 # restore are commands here rather than instructions in a document.
@@ -54,7 +58,7 @@ COMPOSE="docker compose"
 
 # The release this copy belongs to, written in when a release is published. A
 # copy from a checkout keeps the marker, which is not a version.
-BUNDLE_VERSION="${LEERA_BUNDLE_VERSION:-1.13.0}"
+BUNDLE_VERSION="${LEERA_BUNDLE_VERSION:-1.14.0}"
 
 # The bundled object store, and the one tool this script uses on it: bucket
 # setup, backups, restores and the move off MinIO. Pinned by digest as well as
@@ -161,6 +165,9 @@ warn() {
   fi
 }
 report_error() {
+  # Guarded here, not only inside install_report: the self-host tests lift
+  # this function out of the script on its own.
+  [ -z "${INSTALL_REPORT_ID:-}" ] || install_report failed "$*"
   if [ "$JSON_PROGRESS" = "1" ]; then
     [ -n "$CURRENT_STEP" ] && printf '{"event":"step","step":"%s","status":"failed"}\n' "$CURRENT_STEP"
     printf '{"event":"log","level":"error","message":"%s"}\n' "$(json_escape "$*")"
@@ -171,6 +178,64 @@ report_error() {
 fail() {
   report_error "$@"
   exit 1
+}
+
+# ── Install contact ──────────────────────────────────────────────────────────
+
+# Before anything is installed, ask for an email — for the licence key and for
+# help when the install fails, which is all the prompt promises. A heartbeat
+# only arrives once the app runs, so without this an install that stops on
+# Docker, a busy port or DNS is someone we never hear of.
+#
+# Given an email, the installer reports three times at most: started, failed
+# (with its error line) and finished, each with a random id for this run and
+# the OS. Without one it sends nothing. The service stores these and never
+# mails anyone from them. Fresh installs only; a re-run over an existing .env,
+# and the updater (--json-progress), never ask.
+INSTALL_EMAIL=""
+INSTALL_REPORT_ID=""
+LICENSE_SERVICE_URL="${LEERA_LICENSE_SERVICE_URL:-https://api.prod.leera.app}"
+
+ask_install_email() {
+  [ "$JSON_PROGRESS" = "1" ] && return 0
+  [ -f "$INSTALL_DIR/.env" ] && return 0
+  local reply="${LEERA_EMAIL:-}" tty=0
+  # Opened, not `[ -r /dev/tty ]` — see ask_yes_no.
+  { : < /dev/tty; } 2>/dev/null && tty=1
+  while :; do
+    if [ -z "$reply" ] && [ "$tty" = "1" ]; then
+      printf '\033[1;35m[leera]\033[0m Your email, for registering your licence and so we can help if the install fails\n' > /dev/tty
+      printf '        (never used for marketing; press Enter to skip): ' > /dev/tty
+      read -r reply < /dev/tty || reply=""
+    fi
+    reply="$(printf '%s' "$reply" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+    # A conservative character set, not RFC 5322: the address is written into
+    # .env, which this script and compose both source, so a quote, `$`, `&` or
+    # backtick in it would break every later run or execute.
+    case "$reply" in
+      "") return 0 ;;
+      *[!a-z0-9._%+@-]*|*@*@*) ;;
+      ?*@?*.?*) break ;;
+    esac
+    warn "that does not look like an email address"
+    # Unattended, a bad LEERA_EMAIL is dropped rather than stopping the install.
+    [ "$tty" = "1" ] || return 0
+    reply=""
+  done
+  INSTALL_EMAIL="$reply"
+  INSTALL_REPORT_ID="$(od -An -tx1 -N16 /dev/urandom 2>/dev/null | tr -d ' \n' || true)"
+  install_report started
+}
+
+# Never on the install's critical path: five seconds, and any failure ignored.
+install_report() {
+  [ -n "$INSTALL_REPORT_ID" ] || return 0
+  command -v curl >/dev/null 2>&1 || return 0
+  local os
+  os="$( (. /etc/os-release && printf '%s, ' "${PRETTY_NAME:-}") 2>/dev/null || true)$(uname -sm)"
+  curl -fsS --max-time 5 -o /dev/null -H 'Content-Type: application/json' \
+    -d "{\"install_id\":\"$INSTALL_REPORT_ID\",\"email\":\"$(json_escape "$INSTALL_EMAIL")\",\"status\":\"$1\",\"error\":\"$(json_escape "${2:-}")\",\"os\":\"$(json_escape "$os")\"}" \
+    "$LICENSE_SERVICE_URL/api/v1/licensing/install/" >/dev/null 2>&1 || true
 }
 
 # Compose names volumes "<project>_<volume>", and derives the project from the
@@ -2669,6 +2734,7 @@ do_status() {
 # ── Install ──────────────────────────────────────────────────────────────────
 
 do_install() {
+  ask_install_email
   require_docker
 
   mkdir -p "$INSTALL_DIR"
@@ -2827,6 +2893,12 @@ EOM
 # a full backup = database dump + the api container's /data volume + this file.
 LEERA_DOMAIN=$DOMAIN
 LEERA_PUBLIC_URL=$PUBLIC_URL
+# The email given to the installer, filled in for you on the first-run setup
+# page. Nothing else reads it.
+LEERA_INSTALL_EMAIL=$INSTALL_EMAIL
+# This install run's id, kept only until it reports that the app came up, so a
+# re-run after a failed first attempt can say so. Removed once it has.
+LEERA_INSTALL_REPORT_ID=$INSTALL_REPORT_ID
 
 # Who owns ports 80 and 443 on this machine.
 #   bundled  — the Caddy in this stack does, and obtains certificates itself.
@@ -2939,6 +3011,13 @@ EOF
   # shellcheck disable=SC1091
   . ./.env
 
+  # A re-run after a failed first attempt never asks again; it carries on the
+  # report that attempt started, from what it left in .env.
+  if [ -z "$INSTALL_REPORT_ID" ] && [ -n "${LEERA_INSTALL_REPORT_ID:-}" ] && [ -n "${LEERA_INSTALL_EMAIL:-}" ]; then
+    INSTALL_REPORT_ID="$LEERA_INSTALL_REPORT_ID"
+    INSTALL_EMAIL="$LEERA_INSTALL_EMAIL"
+  fi
+
   derive_topology
   check_mail_port
   [ "${LEERA_PROXY_MODE:-bundled}" = "external" ] && write_nginx_conf
@@ -2956,11 +3035,14 @@ EOF
   reload_caddy
 
   if ! wait_for_api; then
+    install_report failed "the API did not come up in time"
     say "the API did not come up in time. Check logs with:"
     say "    cd $INSTALL_DIR && $COMPOSE logs api migrate"
     exit 1
   fi
   start_mx
+  install_report finished
+  env_unset LEERA_INSTALL_REPORT_ID
 
   # In external mode the stack is up but nothing outside can reach it yet: the
   # operator's proxy has no idea we exist. Say what is left, in order, with their
@@ -3079,7 +3161,7 @@ do_qa_runner() {
 }
 
 usage() {
-  sed -n '3,32p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//'
+  sed -n '3,39p' "${BASH_SOURCE[0]:-$0}" | sed 's/^# \{0,1\}//'
 }
 
 # ── Dispatch ─────────────────────────────────────────────────────────────────

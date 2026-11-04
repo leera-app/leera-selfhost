@@ -94,7 +94,9 @@ resolver, and only then continue. If it has not propagated within 10 minutes,
 tell me — do not install anyway and leave me with a broken certificate.
 
 PHASE 6 — Install
-SSH to the server and run:
+Ask whether I want to give the installer my email (it is used to register
+my licence and to help if the install fails). If I do, add LEERA_EMAIL=<email>
+to the command below; if not, leave it out. SSH to the server and run:
   LEERA_DOMAIN=<domain> LEERA_INSTALL_DOCKER=yes \
     bash -c "$(curl -fsSL https://raw.githubusercontent.com/leera-app/leera-selfhost/main/install.sh)"
 Docker does not need to be installed first — the installer handles it. This
@@ -147,6 +149,12 @@ it, and nothing to log out for.
 
 Add `LEERA_INSTALL_DOCKER=yes` to answer the Docker question up front for an
 unattended install, or `LEERA_INSTALL_DOCKER=no` to install Docker yourself.
+
+You will first be asked for your email. It is optional: it is used to register
+your licence and so we can help if the install fails, never for marketing.
+Press Enter to skip it, or set `LEERA_EMAIL=you@example.com` up front for an
+unattended install. With an email, the installer tells us when it starts, stops
+on an error and finishes; without one it sends nothing.
 
 You will be asked for a domain. Enter one (e.g. `pm.example.com`) for automatic
 HTTPS via Let's Encrypt, or leave it blank for plain HTTP on `http://localhost`
