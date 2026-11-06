@@ -25,8 +25,6 @@ Copy this into your agent:
 Install Leera self-hosted for me. First run: curl -fsSL https://raw.githubusercontent.com/leera-app/leera-selfhost/main/AGENT_PROMPT.md and follow those instructions exactly.
 ```
 
-[Read the full prompt](AGENT_PROMPT.md) before you run it.
-
 ## Install it yourself
 
 Interactive:
