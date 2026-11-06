@@ -1,6 +1,6 @@
 # Leera self-hosted
 
-![Leera self-hosted: one command installs the web app, API, database, file storage and HTTPS proxy on your server](assets/overview.svg)
+![Leera self-hosted: one command installs the web app, API, database, file storage and HTTPS proxy on your server](assets/overview.gif)
 
 Run Leera on your own server with one command.
 
