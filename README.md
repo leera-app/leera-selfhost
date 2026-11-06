@@ -17,7 +17,10 @@ Run Leera on your own server with one command.
 | HTTPS | Domain with an A record already pointing at the server |
 | Docker | Not needed. The installer adds it |
 
-## Install with an AI agent
+## Install with an AI agent (Claude Code, Codex, Cursor or other)
+
+<details>
+<summary>Show the prompt</summary>
 
 ````text
 Install Leera (self-hosted) for me, end to end.
@@ -102,6 +105,8 @@ Do not work around it, and do not quietly give up. Tell me:
   - or, if I would rather do that one step myself, exactly what to click
 Then wait for me. A stalled install I can finish beats a half-built one.
 ````
+
+</details>
 
 ## Install it yourself
 
